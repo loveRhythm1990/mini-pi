@@ -1,9 +1,14 @@
 """
-文件工具实现：read / write / edit
+文件工具实现：read / write / edit / bash
 """
 
 import os
+import sys
+import signal
+import subprocess
 import threading
+import time
+from typing import Iterator
 
 
 # ============ 文件锁（并发控制） ============
@@ -84,6 +89,102 @@ def tool_write(path: str, content: str) -> str:
         return f"错误: {str(e)}"
 
 
+def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
+    """
+    执行 bash 命令（基于 pi 的实现）
+    
+    特性：
+    - 超时控制（默认30秒）
+    - 智能输出截断（保留头部和尾部，模拟 pi 的行为）
+    - 合并 stdout 和 stderr
+    - 报告退出码
+    - 支持自定义工作目录
+    - 进程树终止（超时或中断时）
+    
+    Args:
+        command: 要执行的 bash 命令
+        timeout: 超时时间（秒），默认30秒
+        cwd: 工作目录，默认为当前目录
+        
+    Returns:
+        命令输出（包含退出码信息）
+    """
+    try:
+        # pi 的实现会合并 stdout 和 stderr
+        # 参考：packages/coding-agent/src/core/tools/bash.ts
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # 合并到 stdout
+            text=True,
+            cwd=cwd,
+            # 创建新进程组，方便后续终止整个进程树
+            preexec_fn=os.setsid if sys.platform != 'win32' else None
+        )
+        
+        try:
+            # 使用 communicate 并带超时（pi 的做法）
+            output, _ = process.communicate(timeout=timeout)
+            exit_code = process.returncode
+            
+            # pi 的输出截断策略：保留头部和尾部
+            # 参考：packages/agent/src/tool-execution.ts truncateToolOutput
+            max_chars = 20000
+            if len(output) > max_chars:
+                half = max_chars // 2
+                truncated_chars = len(output) - max_chars
+                output = (
+                    output[:half] +
+                    f"\n\n... (截断了 {truncated_chars} 字符，总共 {len(output)} 字符) ...\n\n" +
+                    output[-half:]
+                )
+            
+            # 报告退出码（pi 会在输出中标注）
+            if exit_code == 0:
+                return output if output else "(命令成功执行，无输出)"
+            else:
+                result = output if output else "(无输出)"
+                return f"{result}\n\n❌ 退出码: {exit_code}"
+                
+        except subprocess.TimeoutExpired:
+            # 超时，终止进程树（pi 的做法）
+            try:
+                if sys.platform != 'win32':
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    time.sleep(0.1)
+                    # 如果还没终止，强制 kill
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.terminate()
+                    time.sleep(0.1)
+                    try:
+                        process.kill()
+                    except:
+                        pass
+            except ProcessLookupError:
+                pass
+            
+            # 尝试获取已有的输出
+            try:
+                output, _ = process.communicate(timeout=0.5)
+            except:
+                output = ""
+            
+            return (
+                output + 
+                f"\n\n❌ 命令超时（{timeout}秒）已终止"
+            )
+        
+    except FileNotFoundError:
+        return f"错误: 未找到 shell 或命令不存在"
+    except Exception as e:
+        return f"错误: {str(e)}"
+
+
 def tool_edit(path: str, old_str: str, new_str: str) -> str:
     """
     精确替换文件中的文本（exact unique match）
@@ -136,6 +237,32 @@ def tool_edit(path: str, old_str: str, new_str: str) -> str:
 # ============ 工具定义 ============
 
 TOOLS = [
+    {
+        "name": "bash",
+        "description": (
+            "执行 bash 命令。可以运行任何 shell 命令（ls, grep, git 等）。\n"
+            "注意：\n"
+            "- 命令会在 30 秒后超时\n"
+            "- stdout 和 stderr 会合并输出\n"
+            "- 过长的输出会自动截断（保留头部和尾部）\n"
+            "- 会报告命令的退出码\n"
+            "警告：bash 可以执行任何系统命令，请谨慎使用！"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "要执行的 bash 命令"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "工作目录（可选，默认为当前目录）"
+                }
+            },
+            "required": ["command"]
+        }
+    },
     {
         "name": "read",
         "description": "读取文件内容。返回文件的完整内容（过长会截断）。",
@@ -214,7 +341,9 @@ def execute_tool(name: str, arguments: dict) -> str:
     Returns:
         工具执行结果
     """
-    if name == "read":
+    if name == "bash":
+        return tool_bash(arguments["command"], cwd=arguments.get("cwd"))
+    elif name == "read":
         return tool_read(arguments["path"])
     elif name == "write":
         return tool_write(arguments["path"], arguments["content"])

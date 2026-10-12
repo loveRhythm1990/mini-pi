@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-第 3 章测试：文件工具
+第 3 章测试：文件工具 + bash
 """
 
 import os
+import sys
 import tempfile
 import threading
-from tools import tool_read, tool_write, tool_edit, execute_tool
+import time
+from tools import tool_read, tool_write, tool_edit, tool_bash, execute_tool
 
 
 def test_read():
@@ -166,12 +168,87 @@ def test_concurrent_edit():
         os.remove(temp_path)
 
 
+def test_bash_basic():
+    """测试 bash 工具基础功能"""
+    # 简单命令
+    result = tool_bash("echo 'Hello, bash!'")
+    assert "Hello, bash!" in result
+    assert "错误" not in result
+    
+    # 退出码为0
+    result = tool_bash("exit 0")
+    assert "❌" not in result
+    
+    # 退出码非0
+    result = tool_bash("exit 1")
+    assert "❌" in result
+    assert "退出码: 1" in result
+    
+    print("✅ bash 工具基础测试通过")
+
+
+def test_bash_output_merge():
+    """测试 bash 工具合并 stdout 和 stderr"""
+    # stdout 和 stderr 应该合并
+    result = tool_bash("echo 'stdout'; echo 'stderr' >&2")
+    assert "stdout" in result
+    assert "stderr" in result
+    
+    print("✅ bash 输出合并测试通过")
+
+
+def test_bash_timeout():
+    """测试 bash 工具超时"""
+    # 使用短超时测试
+    # 注：实际执行时间可能稍长于超时时间（由于进程清理）
+    start = time.time()
+    result = tool_bash("sleep 100", timeout=2)
+    elapsed = time.time() - start
+    
+    # 验证超时功能生效（应该远小于100秒）
+    assert elapsed < 15  # 给足够余地处理系统差异
+    assert "超时" in result or "已终止" in result
+    
+    print("✅ bash 超时测试通过")
+
+
+def test_bash_cwd():
+    """测试 bash 工具的工作目录"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 创建测试文件
+        test_file = os.path.join(tmpdir, "test.txt")
+        with open(test_file, 'w') as f:
+            f.write("test")
+        
+        # 在指定目录执行命令
+        result = tool_bash("ls", cwd=tmpdir)
+        assert "test.txt" in result
+    
+    print("✅ bash 工作目录测试通过")
+
+
+def test_bash_truncation():
+    """测试 bash 输出截断"""
+    # 生成大量输出（超过 20000 字符）
+    result = tool_bash("python3 -c \"print('x' * 30000)\"")
+    
+    # 应该被截断
+    assert len(result) < 25000  # 包括截断提示
+    assert "截断" in result or len(result) < 30000
+    
+    print("✅ bash 输出截断测试通过")
+
+
 def test_execute_tool():
     """测试 execute_tool 函数"""
     temp_path = tempfile.mktemp(suffix='.txt')
     
     try:
-        # 测试通过 execute_tool 调用
+        # 测试 bash
+        result = execute_tool("bash", {"command": "echo test"})
+        assert "test" in result
+        
+        # 测试通过 execute_tool 调用其他工具
         result = execute_tool("write", {"path": temp_path, "content": "test"})
         assert "✅" in result
         
@@ -206,6 +283,11 @@ if __name__ == "__main__":
     test_edit_not_found()
     test_edit_multiple_matches()
     test_concurrent_edit()
+    test_bash_basic()
+    test_bash_output_merge()
+    test_bash_timeout()
+    test_bash_cwd()
+    test_bash_truncation()
     test_execute_tool()
     
     print("\n✅ 所有测试通过！")

