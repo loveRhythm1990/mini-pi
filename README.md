@@ -25,13 +25,9 @@
 **核心概念**：统一消息格式、流式输出、多厂商兼容
 
 - 定义统一的 Message / ToolCall 数据结构
-<<<<<<< HEAD
-- 实现 OpenAI 和 Claude 适配器
+- 实现 OpenAI 和 Anthropic (Claude) 适配器
   - OpenAI：`tool_calls` + `role="tool"` 消息
   - Claude：`tool_use` / `tool_result` 内容块
-=======
-- 实现 OpenAI 和 Anthropic 适配器
->>>>>>> 0378292 (添加第2章（多模型适配层）和第3章（文件工具）)
 - 支持流式响应
 - 会话中途切换模型
 
