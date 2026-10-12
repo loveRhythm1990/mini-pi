@@ -12,19 +12,22 @@
 **核心概念**：消息数组、工具调用、循环终止条件
 
 实现一个最基础的 agent 循环：
-- 发送消息给 LLM
-- 解析返回的工具调用
+- 发送消息给 LLM（使用 OpenAI API）
+- 解析返回的工具调用（`tool_calls` 格式）
 - 执行 bash 工具
-- 将结果追加到消息列表
+- 将结果追加到消息列表（`role="tool"` 消息）
 - 循环直到没有工具调用
 
-**代码量**：~150 行 Python
+**代码量**：~160 行 Python  
+**模型**：OpenAI（第 2 章添加 Claude 支持）
 
 ### 第 2 章：多模型适配层（02-providers/）
 **核心概念**：统一消息格式、流式输出、多厂商兼容
 
 - 定义统一的 Message / ToolCall 数据结构
-- 实现 Anthropic 和 OpenAI 适配器
+- 实现 OpenAI 和 Claude 适配器
+  - OpenAI：`tool_calls` + `role="tool"` 消息
+  - Claude：`tool_use` / `tool_result` 内容块
 - 支持流式响应
 - 会话中途切换模型
 
@@ -81,7 +84,13 @@ pip install -r requirements.txt
 
 ### 设置 API Key
 ```bash
-export ANTHROPIC_API_KEY="your-api-key"
+export OPENAI_API_KEY="your-api-key"
+
+# 可选：使用自定义 API 端点（如 Azure OpenAI）
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+
+# 可选：指定模型（默认 gpt-4o-mini）
+export OPENAI_MODEL="gpt-4o"
 ```
 
 ### 运行第 1 章
@@ -122,7 +131,8 @@ python3 01-loop/src/test_main.py
 - **pi 源码**：https://github.com/earendil-works/pi
 - **参考提交**：`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`（2026-10-12）
 - **作者博客**：https://mariozechner.at
-- **Anthropic API 文档**：https://docs.anthropic.com
+- **OpenAI API 文档**：https://platform.openai.com/docs/guides/function-calling
+- **Claude API 文档**：https://docs.anthropic.com/en/docs/tool-use
 
 ## 设计哲学
 
