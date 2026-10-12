@@ -489,6 +489,296 @@ python3 01-loop/src/test_main.py
 
 **第 2 章的任务**：实现一个统一的适配层，让同一份代码可以无缝切换 OpenAI 和 Claude。
 
+## pi 的 Steering vs Follow-up 消息机制
+
+我们的简单循环只有一个停止条件：模型不再请求工具调用。但 pi 有一个更强大的功能：**在 agent 运行时实时插入新消息**。
+
+pi 提供两种队列模式：**steering**（转向）和 **follow-up**（后续）。它们的核心区别在于**何时注入**。
+
+### 注入时机的区别
+
+**Steering 消息**：在**内层循环的每轮开始前**注入
+
+**pi 的代码**（agent-loop.ts 第 175-206 行）：
+
+```typescript
+// Check for steering messages at start (user may have typed while waiting)
+let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+// Outer loop: continues when queued follow-up messages arrive after agent would stop
+while (true) {
+  let hasMoreToolCalls = true;
+
+  // Inner loop: process tool calls and steering messages
+  while (hasMoreToolCalls || pendingMessages.length > 0) {
+    let preparedMessages: AgentMessage[] = [];
+    if (lastCompletedTurn) {
+      // ...准备下一轮...
+      
+      // Preparation can be long-running (for example, compaction). Pick up steering
+      // queued while it ran. Only poll again if the earlier poll returned nothing;
+      // otherwise one-at-a-time mode would deliver two messages in this turn.
+      if (pendingMessages.length === 0) {
+        pendingMessages = (await config.getSteeringMessages?.()) || [];
+      }
+      await emit({ type: "turn_start" });
+    }
+    
+    // Process prepared and queued messages before the next assistant response.
+    for (const message of declareToolChanges(..., pendingMessages)) {
+      // 注入 steering 消息
+    }
+    pendingMessages = [];
+    
+    // 调用模型...
+    // 执行工具...
+    
+    // 每轮结束前再次检查 steering
+    pendingMessages = (await config.getSteeringMessages?.()) || [];
+    if (hasMoreToolCalls || pendingMessages.length > 0) {
+      explicitContinuation = false;
+    }
+  }
+  
+  // (外层循环继续...)
+}
+```
+
+**TypeScript 语法说明**：
+- `while (true)`：无限循环，通过内部 `break` 退出
+- `hasMoreToolCalls || pendingMessages.length > 0`：只要还有工具调用**或**有 steering 消息，内层循环就继续
+- `await emit({ type: "turn_start" })`：发出事件通知（类似 Python 的事件系统）
+- `for (const message of array)`：遍历数组（类似 Python 的 `for message in array`）
+
+**关键行为**：
+- Steering 消息在**每个 turn 开始前**都会被检查和注入
+- **即使还有待执行的工具调用**，新的 steering 消息也会被插入
+- 内层循环条件：`hasMoreToolCalls || pendingMessages.length > 0`
+
+**Follow-up 消息**：只在**外层循环**中检查，即 agent **本该停止时**才注入
+
+**pi 的代码**（agent-loop.ts 第 300-319 行）：
+
+```typescript
+  } // 内层循环结束
+
+  // Agent would stop here. Check for follow-up messages.
+  const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+  if (followUpMessages.length > 0) {
+    // Set as pending so inner loop processes them
+    explicitContinuation = false;
+    pendingMessages = followUpMessages;
+    continue;  // 继续外层循环
+  }
+
+  // No natural request was selected, so fulfill the continuation decision with one context-only turn.
+  if (explicitContinuation) {
+    explicitContinuation = false;
+    continue;
+  }
+
+  // No more messages, exit
+  break;
+}
+```
+
+**关键行为**：
+- Follow-up 消息**只在内层循环退出后**才检查
+- 此时意味着：没有更多工具调用 **且** 没有 steering 消息
+- 如果有 follow-up 消息，将它们转为 `pendingMessages` 并重新进入内层循环
+
+> 参考：  
+> - 内层循环：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/agent/src/agent-loop.ts#L182-L299  
+> - 外层循环：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/agent/src/agent-loop.ts#L302-L319
+
+### 用户如何选择：TUI 键绑定
+
+pi 不会自动判断消息应该是 steering 还是 follow-up，而是让**用户通过键盘选择**。
+
+**TUI 键绑定**（keybindings.ts 第 67-70 行）：
+
+```typescript
+"app.message.followUp": {
+  defaultKeys: windowsKeybindings ? "ctrl+q" : "alt+enter",
+  description: "Queue follow-up message",
+},
+```
+
+**键盘快捷键**：
+- **Enter**（`tui.input.submit`）：
+  - **不在 streaming 时**：正常提交，开始新的 agent 运行
+  - **在 streaming 时**：作为 **steering** 消息队列（通过 `streamingBehavior: "steer"`）
+  
+- **Alt+Enter / Ctrl+Q**（`app.message.followUp`）：
+  - Windows/WSL：`Ctrl+Q`
+  - macOS/Linux：`Alt+Enter`
+  - 总是队列为 **follow-up** 消息
+
+**实现逻辑**（interactive-mode.ts 第 3200、4503 行）：
+
+```typescript
+// 普通 Enter 的处理
+this.defaultEditor.onSubmit = async (text: string) => {
+  // ... 处理各种命令 ...
+  
+  // 如果在 streaming，调用 prompt 时指定 steer
+  if (this.session.isStreaming) {
+    await this.session.prompt(text, { streamingBehavior: "steer" });
+  } else {
+    // 不在 streaming 时，正常启动新的运行
+    await this.session.prompt(text);
+  }
+};
+
+// Alt+Enter 的处理
+private async handleFollowUp(text: string): Promise<void> {
+  // Alt+Enter queues a follow-up message (waits until agent finishes)
+  if (this.session.isStreaming) {
+    this.editor.addToHistory?.(text);
+    this.editor.setText("");
+    await this.session.prompt(text, { streamingBehavior: "followUp" });
+    this.updatePendingMessagesDisplay();
+  }
+  // If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
+  else if (this.editor.onSubmit) {
+    this.editor.setText("");
+    this.editor.onSubmit(text);
+  }
+}
+```
+
+**TypeScript 语法说明**：
+- `async (text: string) => { ... }`：异步箭头函数（类似 Python 的 `async def`）
+- `this.session.isStreaming`：检查 session 是否正在运行
+- `{ streamingBehavior: "steer" }`：对象字面量，指定选项（类似 Python 的字典）
+- `?.`：可选链，如果方法存在就调用
+
+> 参考：  
+> - 键绑定定义：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/coding-agent/src/core/keybindings.ts#L67-L70  
+> - Enter 处理：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3200  
+> - Alt+Enter 处理：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L4503-L4517
+
+### Agent 类方法和队列模式
+
+**Agent 类的 API**（agent.ts 第 280-315 行）：
+
+```typescript
+/** Controls how queued steering messages are drained. */
+set steeringMode(mode: QueueMode) {
+  this.steeringQueue.mode = mode;
+}
+
+get steeringMode(): QueueMode {
+  return this.steeringQueue.mode;
+}
+
+/** Controls how queued follow-up messages are drained. */
+set followUpMode(mode: QueueMode) {
+  this.followUpQueue.mode = mode;
+}
+
+get followUpMode(): QueueMode {
+  return this.followUpQueue.mode;
+}
+
+/** Queue a message to be injected after the current assistant turn finishes. */
+steer(message: AgentMessage): void {
+  this.steeringQueue.enqueue(message);
+}
+
+/** Queue a message to be delivered when the agent would otherwise stop. */
+followUp(message: AgentMessage): void {
+  this.followUpQueue.enqueue(message);
+}
+
+/** Remove all queued steering messages. */
+clearSteeringQueue(): void {
+  this.steeringQueue.clear();
+}
+
+/** Remove all queued follow-up messages. */
+clearFollowUpQueue(): void {
+  this.followUpQueue.clear();
+}
+```
+
+**TypeScript 语法说明**：
+- `set propertyName(value: Type)`：setter 方法（类似 Python 的 `@property` setter）
+- `get propertyName(): Type`：getter 方法（类似 Python 的 `@property`）
+- `: void`：返回类型为 void（无返回值，类似 Python 的 `-> None`）
+
+**队列模式**（types.ts 第 49-55 行）：
+
+```typescript
+/**
+ * Controls how many queued user messages are injected when the agent loop reaches a queue drain point.
+ *
+ * - "all": drain and inject every queued message at that point.
+ * - "one-at-a-time": drain and inject only the oldest queued message, leaving the rest queued for later drain points.
+ */
+export type QueueMode = "all" | "one-at-a-time";
+```
+
+**默认值**（agent.ts 第 247-248 行）：
+
+```typescript
+this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
+this.followUpQueue = new PendingMessageQueue(runtimeOptions.followUpMode ?? "one-at-a-time");
+```
+
+**TypeScript 语法说明**：
+- `runtimeOptions.steeringMode ?? "one-at-a-time"`：空值合并运算符，如果左边是 null/undefined 则返回右边（类似 Python 的 `or` 但更严格）
+
+**队列模式说明**：
+- **`"one-at-a-time"`**（默认）：
+  - 每次 drain 点只注入队列中最老的一条消息
+  - 其余消息留在队列，等待下一个 drain 点
+  - 让 agent 逐条处理用户的多个输入
+  
+- **`"all"`**：
+  - 一次性注入队列中的所有消息
+  - 适合批量处理多条指令
+
+> 参考：  
+> - Agent 方法：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/agent/src/agent.ts#L280-L315  
+> - QueueMode 定义：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/agent/src/types.ts#L49-L55  
+> - 默认值：https://github.com/earendil-works/pi/blob/19cb534c3b6e3871458a8fa59e98f0312c50e995/packages/agent/src/agent.ts#L247-L248
+
+### 实际使用场景
+
+**Steering（转向）**：
+- **场景**：agent 正在执行一个长时间的任务，你发现它走错了方向
+- **行为**：在下一个 turn 开始前立即注入你的纠正消息
+- **示例**：
+  ```
+  Agent: 正在执行 "find / -name '*.log'"...
+  你按 Enter 输入: "停！只搜索 /var/log 目录"
+  → 立即在下一轮注入，引导 agent 改变策略
+  ```
+
+**Follow-up（后续）**：
+- **场景**：agent 完成了当前任务，你想让它继续做下一件事
+- **行为**：等到 agent 完全停止后才注入
+- **示例**：
+  ```
+  Agent: "已完成文件列表，共 42 个文件"
+  你按 Alt+Enter 输入: "现在统计每个文件的行数"
+  → 等待 agent 停止后再注入，避免打断正常流程
+  ```
+
+### 总结表
+
+| 特性 | Steering（转向） | Follow-up（后续） |
+|---|---|---|
+| **注入时机** | 内层循环每轮开始前 | 外层循环，agent 本该停止时 |
+| **检查位置** | 第 175、205、295 行 | 第 302 行 |
+| **典型用途** | 实时纠正、紧急干预 | 任务完成后的后续指令 |
+| **键盘快捷键** | Enter（streaming 时） | Alt+Enter / Ctrl+Q |
+| **API 方法** | `agent.steer(message)` | `agent.followUp(message)` |
+| **队列模式** | `agent.steeringMode` | `agent.followUpMode` |
+| **默认模式** | `"one-at-a-time"` | `"one-at-a-time"` |
+| **循环条件** | `hasMoreToolCalls \|\| pendingMessages.length > 0` | 内层循环退出后检查 |
+
 ## 下一步
 
 完成了基础循环，你已经理解了 agent 的核心原理。但是：
