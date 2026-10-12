@@ -21,19 +21,25 @@
 **代码量**：~160 行 Python  
 **模型**：OpenAI（第 2 章添加 Claude 支持）
 
-### 第 2 章：多模型适配层（02-providers/）
+### 第 2 章：多模型适配层（02-providers/）✅
 **核心概念**：统一消息格式、流式输出、多厂商兼容
 
 - 定义统一的 Message / ToolCall 数据结构
+<<<<<<< HEAD
 - 实现 OpenAI 和 Claude 适配器
   - OpenAI：`tool_calls` + `role="tool"` 消息
   - Claude：`tool_use` / `tool_result` 内容块
+=======
+- 实现 OpenAI 和 Anthropic 适配器
+>>>>>>> 0378292 (添加第2章（多模型适配层）和第3章（文件工具）)
 - 支持流式响应
 - 会话中途切换模型
 
+**代码量**：~400 行 Python
+
 **对比 pi**：`packages/ai/` 的设计（TypeScript）
 
-### 第 3 章：文件工具（03-tools/）
+### 第 3 章：文件工具（03-tools/）✅
 **核心概念**：工具定义、参数验证、错误处理
 
 - read：读取文件内容
@@ -41,6 +47,8 @@
 - edit：精确的文本替换（exact unique match）
 - 工具输出截断
 - 并发工具调用的互斥
+
+**代码量**：~300 行 Python
 
 **对比 pi**：`packages/coding-agent/src/core/tools/`
 
@@ -98,14 +106,36 @@ export OPENAI_MODEL="gpt-4o"
 python3 01-loop/src/main.py
 ```
 
-### 运行测试（无需 API key）
+### 运行第 2 章（多模型适配层）
 ```bash
-pytest 01-loop/src/test_main.py -v
+# 设置 OpenAI API key（主要）
+export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-4o-mini"  # 可选
+
+# 或设置 Anthropic API key（可选）
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+python3 02-providers/src/main.py
 ```
 
-或直接运行测试文件：
+### 运行第 3 章（文件工具）
 ```bash
+export OPENAI_API_KEY="sk-..."
+python3 03-tools/src/main.py
+```
+
+### 运行测试（无需 API key）
+```bash
+# 第 1 章测试
+pytest 01-loop/src/test_main.py -v
+# 或
 python3 01-loop/src/test_main.py
+
+# 第 2 章测试
+pytest 02-providers/src/test_main.py -v
+
+# 第 3 章测试
+pytest 03-tools/src/test_tools.py -v
 ```
 
 ## 学习路径
