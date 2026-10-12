@@ -1,0 +1,21 @@
+{
+  "name": "mini-pi",
+  "version": "0.1.0",
+  "description": "从零构建编程智能体：学习 pi 的中文教程",
+  "type": "module",
+  "scripts": {
+    "ch01": "tsx 01-loop/src/main.ts",
+    "test": "tsx --test **/*.test.ts"
+  },
+  "keywords": ["agent", "ai", "coding-agent", "tutorial", "中文"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
