@@ -1,10 +1,12 @@
 # mini-pi：从零构建编程智能体
 
-一个中文教程，通过实现一个简化版的 [pi](https://github.com/earendil-works/pi) 编程智能体，深入理解 coding agent 的核心原理。
+一个中文教程，通过用 **Python** 实现一个简化版的 [pi](https://github.com/earendil-works/pi) 编程智能体，深入理解 coding agent 的核心原理。
+
+> 注：pi 本身是用 TypeScript 编写的，但本教程用 Python 实现相同的概念，更适合 Python 开发者学习。
 
 ## 课程概览
 
-本教程分为 6 个章节，每个章节都是独立可运行的代码，逐步构建一个完整的编程智能体框架：
+本教程分为 6 个章节，每个章节都是独立可运行的 Python 代码，逐步构建一个完整的编程智能体框架：
 
 ### 第 1 章：Agent 主循环（01-loop/）
 **核心概念**：消息数组、工具调用、循环终止条件
@@ -16,7 +18,7 @@
 - 将结果追加到消息列表
 - 循环直到没有工具调用
 
-**代码量**：~100-150 行
+**代码量**：~150 行 Python
 
 ### 第 2 章：多模型适配层（02-providers/）
 **核心概念**：统一消息格式、流式输出、多厂商兼容
@@ -26,7 +28,7 @@
 - 支持流式响应
 - 会话中途切换模型
 
-**对比 pi**：`packages/ai/` 的设计
+**对比 pi**：`packages/ai/` 的设计（TypeScript）
 
 ### 第 3 章：文件工具（03-tools/）
 **核心概念**：工具定义、参数验证、错误处理
@@ -69,12 +71,12 @@
 ## 快速开始
 
 ### 环境要求
-- Node.js 18+
-- TypeScript 5+
+- Python 3.11+
+- pip
 
 ### 安装依赖
 ```bash
-npm install
+pip install -r requirements.txt
 ```
 
 ### 设置 API Key
@@ -84,17 +86,17 @@ export ANTHROPIC_API_KEY="your-api-key"
 
 ### 运行第 1 章
 ```bash
-npm run ch01
+python3 01-loop/src/main.py
 ```
 
-或直接：
+### 运行测试（无需 API key）
 ```bash
-npx tsx 01-loop/src/main.ts
+pytest 01-loop/src/test_main.py -v
 ```
 
-### 运行测试
+或直接运行测试文件：
 ```bash
-npm test
+python3 01-loop/src/test_main.py
 ```
 
 ## 学习路径
@@ -105,12 +107,13 @@ npm test
    cd pi && npm install && npm run build
    ./packages/coding-agent/bin/pi.js
    ```
+   （注：pi 是 TypeScript/Node.js 项目）
 
 2. **阅读每章的 README.md**：理解核心概念
 
-3. **运行并修改代码**：动手实践
+3. **运行并修改代码**：动手实践（Python 版本）
 
-4. **对比 pi 源码**：看看生产级实现的细节
+4. **对比 pi 源码**：看看生产级实现的细节（附 TypeScript 语法解释）
 
 5. **做练习**：每章末尾都有 2 个练习题
 
@@ -127,8 +130,9 @@ mini-pi 遵循以下原则：
 
 - **极简**：每个章节都是能独立运行的最小实现
 - **可读**：代码和注释都用中文，优先清晰而非性能
-- **渐进**：从 100 行开始，逐步增加复杂度
+- **渐进**：从 150 行 Python 开始，逐步增加复杂度
 - **实用**：每个特性都对应真实需求，不做过度设计
+- **语言友好**：用 Python 实现，但保留与 pi（TypeScript）的对比
 
 ## 贡献
 
