@@ -588,39 +588,64 @@ export const writeTool: ToolDeclaration = {
 
 > 参考：https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/tools/write.ts
 
-### 5. 工具输出的智能截断（packages/agent/src/tool-execution.ts）
+### 5. 工具输出的智能截断
 
-**pi 的截断策略**：
+**两种截断策略**：
+
+1. **通用工具输出**（packages/agent/src/tool-execution.ts）：头尾都保留，中间截断，最多20,000字符
+2. **bash 输出**（packages/coding-agent/src/core/tools/truncate.ts）：只保留尾部，2000行或50KB
+
+**bash 的尾部截断策略**（本章实现的版本）：
 
 ```typescript
-function truncateToolOutput(output: string, maxChars: number = 20000): string {
-  if (output.length <= maxChars) {
-    return output;
+function truncateTail(content: string, maxLines = 2000, maxBytes = 50 * 1024): {
+  content: string;
+  wasTruncated: boolean;
+  tempFilePath?: string;
+} {
+  const lines = content.split('\n');
+  const totalBytes = Buffer.byteLength(content);
+  
+  if (lines.length <= maxLines && totalBytes <= maxBytes) {
+    return { content, wasTruncated: false };
   }
   
-  const halfMax = Math.floor(maxChars / 2);
+  // 从后往前累积行
+  const output: string[] = [];
+  let bytes = 0;
   
-  // 保留前半部分和后半部分，中间省略
-  return (
-    output.slice(0, halfMax) +
-    `\n\n... (truncated ${output.length - maxChars} characters) ...\n\n` +
-    output.slice(-halfMax)
-  );
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (output.length >= maxLines) break;
+    
+    const line = lines[i];
+    const lineBytes = Buffer.byteLength(line) + 1;
+    if (bytes + lineBytes > maxBytes) break;
+    
+    output.unshift(line);
+    bytes += lineBytes;
+  }
+  
+  // 保存完整输出到临时文件
+  const tempFile = saveTempFile(content);
+  
+  return { 
+    content: output.join('\n'),
+    wasTruncated: true,
+    tempFilePath: tempFile 
+  };
 }
 ```
 
 **TypeScript 语法说明**：
-- `Math.floor(x)`：向下取整（类似 Python 的 `int(x)` 或 `//`）
-- `.slice(-n)`：取最后 n 个字符（类似 Python 的 `[-n:]`）
+- `Buffer.byteLength(str)`：计算UTF-8字节数（类似 Python 的 `len(str.encode())`）
+- `.unshift(item)`：在数组开头插入（类似 Python 的 `list.insert(0, item)`）
 
-**为什么前后都保留？**
-- 很多时候，错误信息在输出的**末尾**
-- 只保留前半部分，模型看不到错误
-- 前后都保留，既能看到开头（命令执行了什么），也能看到结尾（结果或错误）
+**为什么 bash 只保留尾部？**
+- 编译日志、测试输出等，错误信息和最终结果通常在**末尾**
+- 限制行数（2000）和字节数（50KB），先达到哪个就停止
+- 完整输出保存到临时文件，需要时 LLM 可以用 read 工具读取
 
-我们的实现只保留前半部分，pi 的策略更好。
-
-> 参考：https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/agent/src/tool-execution.ts#L200-L220
+> 参考：`packages/coding-agent/src/core/tools/truncate.ts` 第168-230行
 
 ## bash 工具：最强大但最危险
 
