@@ -1265,6 +1265,8 @@ export function estimateTokens(message: AgentMessage): number {
 
 **为什么是 chars/4？** GPT tokenizer 的经验法则：英文平均 ~4 字符/token。这是保守估算（高估），确保不会触发 context overflow。
 
+**⚠️ CJK 文本的低估问题**：chars/4 启发式对中文/日文/韩文等 CJK 文本会**严重低估** token 数。常见 tokenizer（OpenAI、Claude）中，CJK 字符通常是 **~1 token/字符甚至更多**（vs 英文的 4 字符/token）。pi 对所有语言统一使用 chars/4，没有 CJK 特殊处理。对 mini-pi 的影响：在中文为主的会话中，实际 token 消耗可能是估算的 4 倍，导致过晚触发 compaction 或意外的 context overflow。建议方案：(1) 使用 `tiktoken` 库精确计算 OpenAI token（`encoding = tiktoken.encoding_for_model("gpt-4o-mini")`），或 (2) 实现 CJK 感知启发式（检测 CJK Unicode 范围 U+4E00-U+9FFF、U+3040-U+30FF 等，对 CJK 字符用 chars/1 或 chars/1.5，其他用 chars/4）。
+
 **Compaction 触发**（`packages/coding-agent/src/core/settings-schema.ts`）：
 
 ```typescript
@@ -1275,7 +1277,7 @@ export function estimateTokens(message: AgentMessage): number {
 }
 ```
 
-当 `estimatedTokens > contextWindow - reserveTokens` 时触发，保留最近的消息，旧消息通过 LLM 总结压缩。
+当 `estimatedTokens > contextWindow - reserveTokens` 时触发，保留最近的消息，旧消息通过 LLM 总结压缩（详见第4章 compaction 机制）。
 
 **Python 实现**：
 
