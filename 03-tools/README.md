@@ -656,59 +656,10 @@ function truncateToolOutput(output: string, maxChars: number = 20000): string {
 - `sleep 3600` 会挂起一小时
 - 死循环会永远运行
 
-**pi 的应对**（packages/coding-agent/src/core/tools/bash.ts）：
-
-```typescript
-export const bashTool: ToolDeclaration = {
-  name: "bash",
-  description: "Execute a bash command. Will be killed after 5 minutes.",
-  // ...
-  execute: async (args, context) => {
-    const { command } = args;
-    
-    // 默认超时 5 分钟
-    const timeoutMs = 5 * 60 * 1000;
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    
-    try {
-      const result = await execCommand(command, {
-        signal: controller.signal,
-        cwd: context.workspaceRoot,
-      });
-      
-      return { output: result.stdout + result.stderr, exitCode: result.exitCode };
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        return { error: "Command timed out (5 minutes)" };
-      }
-      throw err;
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  },
-};
-```
-
-**TypeScript 语法说明**：
-- `async (args, context) => { ... }`：异步箭头函数（类似 Python 的 `async def`）
-- `new AbortController()`：创建中止控制器对象
-- `setTimeout(fn, ms)`：设置定时器，ms 毫秒后调用 fn
-- `controller.abort()`：触发中止信号
-- `try { ... } finally { ... }`：无论是否出错都执行 finally（类似 Python）
-- `err.name === 'AbortError'`：检查错误类型（类似 Python 的 `isinstance(err, AbortError)`）
-- `clearTimeout(timeoutId)`：清除定时器
-
-**我们的实现**（Python）：
-```python
-try:
-    output, _ = process.communicate(timeout=timeout)
-except subprocess.TimeoutExpired:
-    # 终止进程树
-    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    return f"命令超时（{timeout}秒）已终止"
-```
+**pi 的实现细节见本章末尾"bash 工具完整实现"部分**，包括：
+- 可配置的超时（无默认超时，用户指定）
+- `waitForChildProcess` 函数处理超时和 AbortSignal
+- `killProcessTree` 确保终止整个进程树
 
 #### 3. 巨大的输出与截断（Huge Outputs and Truncation）
 
@@ -721,34 +672,68 @@ except subprocess.TimeoutExpired:
 - `cat /dev/urandom` 会持续生成随机数据
 - `tail -f logfile` 会持续跟踪日志
 
-**pi 的应对**（packages/agent/src/tool-execution.ts）：
+**pi 的应对**（packages/coding-agent/src/core/tools/truncate.ts，commit 7d75a0e）：
+
+Pi 使用**双重限制**策略（行数 + 字节数），而不是简单的字符数截断：
 
 ```typescript
-function truncateToolOutput(output: string, maxChars: number = 20000): string {
-  if (output.length <= maxChars) {
-    return output;
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
+
+/**
+ * Truncate content from the tail (keep last N lines/bytes).
+ * Suitable for bash output where you want to see the end (errors, final results).
+ */
+export function truncateTail(content: string, options: TruncationOptions = {}): TruncationResult {
+  const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+  
+  const totalBytes = Buffer.byteLength(content, "utf-8");
+  const lines = splitLinesForCounting(content);
+  const totalLines = lines.length;
+  
+  // Work backwards from the end
+  const outputLinesArr: string[] = [];
+  let outputBytesCount = 0;
+  let truncatedBy: "lines" | "bytes" = "lines";
+  
+  for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
+    const line = lines[i];
+    const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 ? 1 : 0);
+    
+    if (outputBytesCount + lineBytes > maxBytes) {
+      truncatedBy = "bytes";
+      break;
+    }
+    
+    outputLinesArr.unshift(line);
+    outputBytesCount += lineBytes;
   }
   
-  const halfMax = Math.floor(maxChars / 2);
-  
-  // 保留前半部分和后半部分，中间省略
-  return (
-    output.slice(0, halfMax) +
-    `\n\n... (truncated ${output.length - maxChars} characters) ...\n\n` +
-    output.slice(-halfMax)
-  );
+  return { content: outputLinesArr.join("\n"), truncated, truncatedBy, ... };
 }
 ```
 
 **TypeScript 语法说明**：
-- `Math.floor(x)`：向下取整（类似 Python 的 `int(x)` 或 `//`）
-- `.slice(0, n)`：字符串切片，取前 n 个字符（类似 Python 的 `[:n]`）
-- `.slice(-n)`：取最后 n 个字符（类似 Python 的 `[-n:]`）
+- `?? value`：空值合并运算符，左边是 null/undefined 时返回右边（类似 Python 的 `or`）
+- `Buffer.byteLength(str, "utf-8")`：获取字符串的 UTF-8 字节数
+- `.unshift(item)`：在数组开头插入元素（类似 Python 的 `list.insert(0, item)`）
+- `i--`：递减循环，从末尾向前遍历
 
-**为什么前后都保留？**
-- 很多时候，**错误信息在输出的末尾**（如编译错误、测试失败）
-- 只保留开头，模型看不到错误
-- 前后都保留，既能看到开头（命令执行了什么），也能看到结尾（结果或错误）
+**bash工具的实际截断行为**（packages/coding-agent/src/core/tools/bash.ts 第255行）：
+```typescript
+description: `Execute a ${config.shellName} command in the current working directory. 
+Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or 
+${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first).`
+```
+
+**关键发现**：
+1. **只保留尾部**，不保留头部：bash输出通常最后几行最重要（错误信息、最终结果）
+2. **双重限制**：2000行 **或** 50KB，哪个先达到就截断
+3. **从后向前累积**：逐行从后向前添加，直到触及任一限制
+4. **完整行**：不会在行中间截断（除非单行超过字节限制）
+
+> 参考：`packages/coding-agent/src/core/tools/truncate.ts` 第168-230行
 
 #### 4. 非确定性（Non-Determinism）
 
@@ -830,83 +815,150 @@ function truncateToolOutput(output: string, maxChars: number = 20000): string {
 
 > **未验证点**：pi 是否在生产部署中实现了沙箱，以及具体的实现方式（Docker、VM、chroot 等）。
 
-### pi 的 bash 工具完整实现（简化版）
+### pi 的 bash 工具完整实现（真实代码）
 
-**packages/coding-agent/src/core/tools/bash.ts**：
+**packages/coding-agent/src/core/tools/bash.ts**（commit 7d75a0e，第1-100行 + 关键片段）：
 
 ```typescript
 import { spawn } from "child_process";
+import { waitForChildProcess } from "../../utils/child-process.ts";
+import { killProcessTree, trackDetachedChildPid } from "../../utils/shell.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult } from "./truncate.ts";
 
-export const bashTool: ToolDeclaration = {
-  name: "bash",
-  description: `Execute a bash command in the workspace.
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
-Timeout: 5 minutes
-Output: stdout and stderr are combined
-Exit code: reported in the result
+const bashSchema = Type.Object({
+  command: Type.String({ description: "Shell command to execute" }),
+  timeout: Type.Optional(Type.Number({ 
+    description: "Timeout in seconds (optional, no default timeout)" 
+  })),
+});
 
-Use this for:
-- Running scripts or build commands
-- Checking file contents (though 'read' is preferred)
-- Installing dependencies (npm, pip, etc.)
-
-Note: This tool can modify the filesystem, network, and system state.`,
-  
-  inputSchema: {
-    type: "object",
-    properties: {
-      command: {
-        type: "string",
-        description: "The bash command to execute",
-      },
+export interface BashOperations {
+  exec: (
+    command: string,
+    cwd: string,
+    options: {
+      onData: (data: Buffer) => void;
+      signal?: AbortSignal;
+      timeout?: number;
+      env?: NodeJS.ProcessEnv;
     },
-    required: ["command"],
-  },
+  ) => Promise<{ exitCode: number | null }>;
+}
+
+export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
+  return {
+    exec: async (command, cwd, { onData, signal, timeout, env }) => {
+      const timeoutMs = resolveTimeoutMs(timeout);
+      const shellConfig = resolveShellConfig();
+      
+      const child = spawn(shellConfig.shell, [shellConfig.shellFlag, command], {
+        cwd,
+        env: { ...shellConfig.env, ...env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      
+      trackDetachedChildPid(child.pid);
+      
+      // Stream output
+      child.stdout?.on("data", onData);
+      child.stderr?.on("data", onData);
+      
+      // Handle timeout and abort
+      const exitCode = await waitForChildProcess(child, { timeout: timeoutMs, signal });
+      
+      // Cleanup
+      if (child.exitCode === null) {
+        await killProcessTree(child.pid);
+      }
+      
+      return { exitCode };
+    },
+  };
+}
+```
+
+**bash工具的核心执行逻辑**（第260-395行，精简）：
+
+```typescript
+export function defineBashTool(config: BashToolConfig): ToolDefinition<BashToolInput, BashToolOutput> {
+  const operations = config.operations ?? createLocalShellOperations(...);
   
-  execute: async (args, context) => {
-    const { command } = args;
+  return {
+    name: "bash",
+    description: `Execute a ${config.shellName} command in the current working directory. 
+    Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or 
+    ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is 
+    saved to a temp file. Optionally provide a timeout in seconds.`,
     
-    return new Promise((resolve) => {
-      const child = spawn("bash", ["-c", command], {
-        cwd: context.workspaceRoot,
-        timeout: 5 * 60 * 1000,  // 5 分钟
-      });
+    schema: bashSchema,
+    
+    execute: async (args, context) => {
+      const { command, timeout } = args;
+      const accumulator = new OutputAccumulator();
+      const startTime = Date.now();
       
-      let stdout = "";
-      let stderr = "";
-      
-      child.stdout.on("data", (data) => {
-        stdout += data.toString();
-      });
-      
-      child.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
-      
-      child.on("close", (code) => {
-        const output = stdout + stderr;
-        const truncated = truncateToolOutput(output);
+      try {
+        const result = await operations.exec(
+          command,
+          context.cwd,
+          {
+            onData: (data) => accumulator.append(data),
+            signal: context.signal,
+            timeout,
+            env: context.env,
+          },
+        );
         
-        resolve({
-          output: truncated,
-          exitCode: code,
+        const wallTimeSeconds = (Date.now() - startTime) / 1000;
+        const fullOutput = accumulator.getOutput();
+        
+        // Truncate for model (tail truncation)
+        const truncation = truncateTail(fullOutput.toString("utf-8"), {
+          maxLines: DEFAULT_MAX_LINES,
+          maxBytes: DEFAULT_MAX_BYTES,
         });
-      });
-      
-      child.on("error", (err) => {
-        resolve({ error: err.message });
-      });
-    });
-  },
-};
+        
+        // Save full output if truncated
+        let fullOutputPath: string | undefined;
+        if (truncation.truncated) {
+          fullOutputPath = await saveTempFile(fullOutput);
+        }
+        
+        return {
+          output: truncation.content,
+          truncated: truncation.truncated,
+          full_output_path: fullOutputPath,
+          exit_code: result.exitCode ?? -1,
+          wall_time_seconds: wallTimeSeconds,
+        };
+        
+      } catch (err) {
+        return { error: err.message, exit_code: -1, wall_time_seconds: 0 };
+      }
+    },
+  };
+}
 ```
 
 **TypeScript 语法说明**：
-- `spawn("bash", ["-c", command], options)`：创建子进程（类似 Python 的 `subprocess.Popen`）
-- `new Promise((resolve) => { ... })`：创建 Promise 对象（异步操作的封装）
-- `child.stdout.on("data", callback)`：监听事件（类似 Python 的事件循环）
-- `data.toString()`：将 Buffer 转为字符串
-- `resolve(value)`：完成 Promise，返回 value
+- `spawn(shell, [flag, command], options)`：创建子进程（类似 Python 的 `subprocess.Popen`）
+- `child.stdout?.on("data", callback)`：可选链 + 事件监听
+- `await waitForChildProcess(child, options)`：等待进程结束（带超时和abort支持）
+- `Date.now()`：当前时间戳（毫秒）
+- `??`：空值合并运算符，`exitCode ?? -1` 表示 exitCode 为 null 时返回 -1
+
+**关键设计**：
+1. **OutputAccumulator**：边执行边累积输出（流式）
+2. **独立的截断逻辑**：使用 `truncateTail` 函数
+3. **完整输出保存**：截断时保存完整输出到临时文件
+4. **进程树终止**：`killProcessTree` 确保所有子进程都被杀死
+5. **返回墙上时间**：`wall_time_seconds` 报告实际执行时间
+
+> 参考：`packages/coding-agent/src/core/tools/bash.ts` 第1-442行，commit 7d75a0e
 
 ### 我们的实现对比
 

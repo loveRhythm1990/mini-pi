@@ -670,7 +670,248 @@ export function validateAndFixMessages(messages: AgentMessage[]): {
 
 > 参考：https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/ai/src/message-validation.ts
 
-## 总结对比表
+## pi 的高级特性实现（深入分析）
+
+mini-pi 的实现涵盖了核心功能，但 pi 还有一些高级特性值得深入了解。以下基于 pi 仓库 commit `7d75a0e3eb273dff753d49c066ea29fbe7b3b6f6` 的真实源码分析。
+
+### 1. 消息验证与自动修复
+
+**实际情况**：经过源码审查，pi 的消息验证主要在 **provider 层面**，而不是统一的消息验证层。
+
+**packages/ai/src/utils/transcript.ts** 中的 `normalizeContext` 函数（第50-80行）：
+
+```typescript
+export function normalizeContext(context: Context | TranscriptContext): TranscriptContext {
+  if ("messages" in context) {
+    return context;
+  }
+  
+  // 将单条消息或消息数组转换为标准格式
+  if (Array.isArray(context)) {
+    return { messages: context };
+  }
+  
+  return { messages: [context] };
+}
+```
+
+**关键发现**：
+- **修正声明**：pi 没有像最初表格所述的"自动修复不合规消息"的统一验证层
+- 实际上，每个 provider（OpenAI、Anthropic等）在转换消息时会进行基本的格式规范化
+- 例如 OpenAI adapter 会确保消息角色正确，但不会自动修复复杂的不合规情况（如孤立的 tool_result）
+
+**Python 实现建议**：
+```python
+def normalize_messages(messages: list[Message]) -> list[Message]:
+    """基本的消息格式规范化"""
+    if not messages:
+        raise ValueError("Messages list cannot be empty")
+    
+    # 确保第一条是 user 消息
+    if messages[0].role != "user":
+        messages.insert(0, Message(role="user", content="(session start)"))
+    
+    return messages
+```
+
+> **未验证**：pi 可能在 coding-agent 层有更高级的消息验证，但在 ai/agent 核心包中未找到统一的验证逻辑。
+
+### 2. 更多厂商支持（Provider Registry）
+
+**packages/ai/src/providers/** 目录包含 30+ 厂商：
+
+```typescript
+// packages/ai/src/providers/google.ts (commit 7d75a0e, 第1-15行)
+import { googleGenerativeAIApi } from "../api/google-generative-ai.lazy.ts";
+import { envApiKeyAuth } from "../auth/helpers.ts";
+import { createProvider, type Provider } from "../models.ts";
+import { GOOGLE_MODELS } from "./google.models.ts";
+
+export function googleProvider(): Provider<"google-generative-ai"> {
+  return createProvider({
+    id: "google",
+    name: "Google",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    auth: { apiKey: envApiKeyAuth("Gemini API key", ["GEMINI_API_KEY"]) },
+    models: Object.values(GOOGLE_MODELS),
+    api: googleGenerativeAIApi(),
+  });
+}
+```
+
+**Ollama 支持**（OpenAI-compatible endpoint）：
+
+pi 通过 **OpenAI adapter + 自定义 baseUrl** 支持 Ollama：
+
+```typescript
+// packages/ai/src/providers/openai.ts (简化)
+export function openaiProvider(options?: { baseUrl?: string }): Provider<"openai-responses"> {
+  return createProvider({
+    id: "openai",
+    baseUrl: options?.baseUrl ?? "https://api.openai.com/v1",
+    api: openAIResponsesApi(),
+    models: OPENAI_MODELS,
+  });
+}
+```
+
+**使用方式**：
+```typescript
+const models = createModels({
+  providers: [
+    openaiProvider({ baseUrl: "http://localhost:11434/v1" }), // Ollama
+  ],
+});
+```
+
+**Python 实现建议**：
+```python
+class OpenAICompatibleAdapter(OpenAIAdapter):
+    """支持 OpenAI 兼容的端点（如 Ollama）"""
+    def __init__(self, base_url: str, api_key: str = "dummy", model: str = "llama2"):
+        super().__init__(api_key=api_key, model=model, base_url=base_url)
+```
+
+> 参考：`packages/ai/src/providers/google.ts` 和 `packages/ai/src/providers/openai.ts`
+
+### 3. Token 预算管理
+
+**packages/ai/src/types.ts** 中的 Usage 类型（第578-630行）：
+
+```typescript
+export interface Usage {
+  /** Input tokens */
+  inputTokens: number;
+  /** Output tokens */
+  outputTokens: number;
+  /** Total tokens (inputTokens + outputTokens) */
+  totalTokens: number;
+  /** Estimated cost in USD, if available */
+  cost?: number;
+}
+
+export interface AssistantMessage {
+  role: "assistant";
+  content: MessageContent[];
+  stopReason?: StopReason;
+  usage: Usage;  // 每条消息都带 usage
+}
+```
+
+**Token 计数**：每个 provider 在响应中返回 usage 信息，pi 自动累积。
+
+**上下文溢出处理**：在 coding-agent 中通过 **compaction**（压缩）处理：
+
+```typescript
+// packages/agent/src/agent.ts 中有 compaction 逻辑（未完整展示）
+// 当上下文接近限制时，会：
+// 1. 保留最近的 N 条消息
+// 2. 总结/压缩较早的消息
+// 3. 插入摘要消息代替原始历史
+```
+
+**Python 实现建议**：
+```python
+@dataclass
+class Usage:
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost: float | None = None
+
+def calculate_cost(usage: Usage, model: str) -> float:
+    """根据模型定价计算成本"""
+    rates = {
+        "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
+        "claude-3-5-sonnet": {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000},
+    }
+    rate = rates.get(model, {"input": 0, "output": 0})
+    return usage.input_tokens * rate["input"] + usage.output_tokens * rate["output"]
+```
+
+> **未验证**：具体的 compaction 算法细节需要深入研究 `packages/agent/src` 中的相关代码。
+
+### 4. 中止信号（AbortSignal）全链路传递
+
+**packages/ai/src/types.ts** 中的 signal 参数（第158行）：
+
+```typescript
+export interface ProviderStreamOptions {
+  signal?: AbortSignal;  // 传递给 provider
+  // ...
+}
+```
+
+**agent-loop 中的传递**（packages/agent/src/agent-loop.ts，简化）：
+
+```typescript
+async function streamAssistantResponse(
+  context: AgentContext,
+  config: AgentLoopConfig,
+  signal: AbortSignal | undefined,
+): Promise<AssistantMessage> {
+  // 1. 传递给 LLM provider
+  const response = await streamFunction(config.model, llmContext, {
+    signal,  // ← 传给 provider
+    ...config,
+  });
+  
+  // 2. provider 内部传递给 HTTP fetch
+  // 3. fetch 会响应 abort 信号立即取消请求
+}
+
+async function executeToolCalls(
+  context: AgentContext,
+  toolCalls: ToolCall[],
+  signal: AbortSignal | undefined,
+): Promise<ToolResult[]> {
+  const results = [];
+  for (const tc of toolCalls) {
+    // 传递给工具执行
+    const result = await executeTool(tc, context, signal);  // ← 传给工具
+    results.push(result);
+  }
+  return results;
+}
+```
+
+**bash 工具中的使用**（packages/coding-agent/src/core/tools/bash.ts）：
+
+```typescript
+execute: async (args, context) => {
+  const result = await operations.exec(command, cwd, {
+    signal: context.signal,  // ← 工具接收并传递给子进程
+    timeout,
+  });
+}
+```
+
+**Python 实现建议**：
+Python 没有内置的 AbortSignal，但可以用 `asyncio` 的取消机制：
+
+```python
+import asyncio
+
+async def agent_loop_with_cancellation(provider, messages, cancel_event: asyncio.Event):
+    """带取消支持的 agent 循环"""
+    try:
+        for step in range(10):
+            if cancel_event.is_set():
+                raise asyncio.CancelledError("User cancelled")
+            
+            # 调用 provider（需要支持 cancel_event）
+            response = await provider.create_completion_async(
+                messages, tools, cancel_event=cancel_event
+            )
+            # ...
+    except asyncio.CancelledError:
+        print("Agent loop cancelled")
+        raise
+```
+
+> 参考：`packages/ai/src/types.ts` 第158行，`packages/agent/src/agent-loop.ts`，`packages/coding-agent/src/core/tools/bash.ts`
+
+## 总结对比表（修正版）
 
 | 特性 | mini-pi (Python) | pi 真实实现 (TypeScript) |
 |---|---|---|
@@ -678,11 +919,15 @@ export function validateAndFixMessages(messages: AgentMessage[]): {
 | OpenAI 支持 | ✅ 完整支持 | ✅ 完整支持 |
 | Anthropic 支持 | ✅ 完整支持 | ✅ 完整支持 + 扩展思维模式 |
 | 流式输出 | ✅ 支持 | ✅ 支持 + 更细粒度的事件 |
-| 消息验证 | ❌ | ✅ 自动修复不合规消息 |
-| 更多厂商 | ❌ | ✅ Google Gemini、Ollama 等 |
-| Token 预算管理 | ❌ | ✅ 内置计数和截断 |
-| 中止信号 | ❌ | ✅ 全链路 AbortSignal |
-| 代码行数 | ~400 行 Python | ~2000 行 TypeScript（包含多家厂商）|
+| 消息验证 | ❌ | ⚠️ **修正**：基本规范化（非完整验证）|
+| 更多厂商 | ❌ | ✅ 30+ providers（Google、Azure、Mistral等）+ OpenAI 兼容端点（Ollama） |
+| Token 预算管理 | ❌ | ✅ 每条消息带 usage + compaction（未完全验证）|
+| 中止信号 | ❌ | ✅ 全链路 AbortSignal（agent → provider → fetch + tools）|
+| 代码行数 | ~400 行 Python | ~2000 行 TypeScript（ai包核心）+ ~1500 行（agent包）|
+
+**修正说明**：
+- ✅ **消息验证**：原声明"自动修复不合规消息"过于夸大。实际上 pi 只做基本的格式规范化（normalize），没有复杂的自动修复逻辑。
+- ✅ **Token 管理**：compaction 的具体实现未在本次审查中完全验证，但 Usage 类型和基本计数确实存在。
 
 ## 如何运行
 
