@@ -1163,62 +1163,142 @@ class OpenAICompatibleAdapter(OpenAIAdapter):
 
 > 参考：`packages/ai/src/providers/google.ts` 和 `packages/ai/src/providers/openai.ts`
 
-### 3. Token 预算管理
+### 3. Token 计数与限制机制
 
-**packages/ai/src/types.ts** 中的 Usage 类型（第578-630行）：
+pi 通过三层机制管理 token：**模型元数据声明**、**实际 usage 解析**、**本地估算**。
+
+#### 模型元数据：contextWindow / maxTokens / cost
+
+**来源**：自动生成脚本（`packages/ai/scripts/generate-models.ts`，约129KB）+ 外部 catalog
+
+运行 `npm run generate-models` 生成所有模型定义到 `packages/ai/src/providers/data/*.json`：
 
 ```typescript
-export interface Usage {
-  /** Input tokens */
-  inputTokens: number;
-  /** Output tokens */
-  outputTokens: number;
-  /** Total tokens (inputTokens + outputTokens) */
-  totalTokens: number;
-  /** Estimated cost in USD, if available */
-  cost?: number;
-}
-
-export interface AssistantMessage {
-  role: "assistant";
-  content: MessageContent[];
-  stopReason?: StopReason;
-  usage: Usage;  // 每条消息都带 usage
+{
+  "chat": {
+    "gpt-4o-mini": {
+      "id": "gpt-4o-mini",
+      "api": "openai-responses",
+      "contextWindow": 128000,
+      "maxTokens": 16384,
+      "cost": {
+        "input": 0.15,      // USD per million tokens
+        "output": 0.60,
+        "cacheRead": 0.075,
+        "cacheWrite": 0.15,
+        "tiers": [...]      // 分级定价
+      }
+    }
+  }
 }
 ```
 
-**Token 计数**：每个 provider 在响应中返回 usage 信息，pi 自动累积。
+**数据来源**：OpenRouter API catalog、手工维护、AI Gateway定价。自定义模型通过 Radius gateway 配置文件声明。
 
-**上下文溢出处理**：在 coding-agent 中通过 **compaction**（压缩）处理：
+#### 实际 Usage Token 获取
+
+**从 provider streaming response 实时解析**
+
+**OpenAI**（`packages/ai/src/api/openai-responses-shared.ts` 第659-686行）：
 
 ```typescript
-// packages/agent/src/agent.ts 中有 compaction 逻辑（未完整展示）
-// 当上下文接近限制时，会：
-// 1. 保留最近的 N 条消息
-// 2. 总结/压缩较早的消息
-// 3. 插入摘要消息代替原始历史
+const cachedTokens = inputDetails?.cached_tokens || 0;
+const cacheWriteTokens = inputDetails?.cache_write_tokens || 0;
+
+output.usage = {
+  input: Math.max(0, (response.usage.input_tokens || 0) - cachedTokens - cacheWriteTokens),
+  output: response.usage.output_tokens || 0,
+  cacheRead: cachedTokens,
+  cacheWrite: cacheWriteTokens,
+  reasoning: response.usage.output_tokens_details?.reasoning_tokens || 0,
+  totalTokens: response.usage.total_tokens || 0,
+  cost: { ... },
+};
+calculateCost(model, output.usage);
 ```
 
-**Python 实现建议**：
+**Anthropic**（`packages/ai/src/api/anthropic-messages.ts` 第380-393行）：
+
+```typescript
+output.usage.cacheRead = event.message.usage.cache_read_input_tokens || 0;
+output.usage.cacheWrite = event.message.usage.cache_creation_input_tokens || 0;
+output.usage.cacheWrite1h = event.message.usage.cache_creation?.ephemeral_1h_input_tokens || 0;
+// Anthropic 1h cache write 按 2x base input 计费
+```
+
+**成本计算**（`packages/ai/src/models.ts` 第1206-1226行）：
+
+```typescript
+export function calculateCost(model: AnyModel, usage: Usage): Usage["cost"] {
+  let rates = model.cost;
+  // 分级定价：根据累计 input token 选择 tier
+  for (const tier of model.cost.tiers ?? []) {
+    if (inputTokens > tier.inputTokensAbove) rates = tier;
+  }
+  
+  const longWrite = usage.cacheWrite1h ?? 0;
+  const shortWrite = usage.cacheWrite - longWrite;
+  usage.cost.input = (rates.input / 1000000) * usage.input;
+  usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1000000;
+  // ...
+}
+```
+
+#### 本地 Token 估算（用于 Compaction 决策）
+
+**关键：使用 chars/4 启发式，无真实 tokenizer**
+
+**估算函数**（`packages/coding-agent/src/core/compaction/compaction.ts` 第298-340行）：
+
+```typescript
+export function estimateTokens(message: AgentMessage): number {
+  let chars = 0;
+  switch (message.role) {
+    case "system":
+      chars = estimateTextAndImageContentChars(system.content);
+      if (system.sections) chars += JSON.stringify(system.sections).length;
+      return Math.ceil(chars / 4);  // 关键：字符数除以4
+    // ...
+  }
+}
+```
+
+**为什么是 chars/4？** GPT tokenizer 的经验法则：英文平均 ~4 字符/token。这是保守估算（高估），确保不会触发 context overflow。
+
+**Compaction 触发**（`packages/coding-agent/src/core/settings-schema.ts`）：
+
+```typescript
+{
+  enabled: Type.Boolean({ default: true }),
+  reserveTokens: Type.Number({ default: ... }),      // 预留空间
+  keepRecentTokens: Type.Number({ default: ... }),   // 保留最近N token
+}
+```
+
+当 `estimatedTokens > contextWindow - reserveTokens` 时触发，保留最近的消息，旧消息通过 LLM 总结压缩。
+
+**Python 实现**：
+
 ```python
 @dataclass
 class Usage:
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-    cost: float | None = None
+    input: int
+    output: int
+    cache_read: int = 0
+    cache_write: int = 0
+    reasoning: int = 0
+    total_tokens: int = 0
+    cost: dict = field(default_factory=dict)
 
-def calculate_cost(usage: Usage, model: str) -> float:
-    """根据模型定价计算成本"""
-    rates = {
-        "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
-        "claude-3-5-sonnet": {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000},
-    }
-    rate = rates.get(model, {"input": 0, "output": 0})
-    return usage.input_tokens * rate["input"] + usage.output_tokens * rate["output"]
+def estimate_tokens(text: str) -> int:
+    return math.ceil(len(text) / 4)
+
+def should_compact(messages: list, context_window: int, reserve: int = 10000) -> bool:
+    estimated = sum(estimate_tokens(msg.content) for msg in messages)
+    return estimated > context_window - reserve
 ```
 
-> ⚠️ **Compaction 算法细节**：具体的消息压缩策略位于 `packages/agent/src/compaction/`，包括分支总结和上下文管理，本文未深入分析。
+> ⚠️ **未深入验证**：OpenRouter catalog API端点、Radius gateway配置schema、Compaction阈值默认值需查看完整源码。
 
 ### 4. 中止信号（AbortSignal）全链路传递
 
