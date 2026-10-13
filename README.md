@@ -48,15 +48,19 @@
 
 **对比 pi**：`packages/coding-agent/src/core/tools/`
 
-### 第 4 章：会话管理（04-sessions/）
+### 第 4 章：会话管理与上下文压缩（04-sessions/）✅
 **核心概念**：持久化、恢复、分支、压缩
 
-- JSONL 格式存储
-- 基于 id/parentId 的树形结构
-- fork 和 tree 导航
-- 上下文压缩（token 超限时自动总结）
+- JSONL 格式存储（header + 只追加的 entry）
+- 基于 id/parentId 的树形结构，leaf 指针与分支
+- 恢复会话、从 entry 投影出 LLM 上下文
+- 上下文压缩：阈值 / 溢出 / 手动 `/compact` 三种触发
+- 切点选择（不拆开 tool 调用与结果）、split turn、增量更新摘要、分支摘要
+- CJK 感知的 token 估算（chars/4 会低估中文）
 
-**对比 pi**：`session-manager.ts` 和 `compaction.ts`
+**代码量**：~700 行 Python
+
+**对比 pi**：`session-manager.ts` 和 `compaction/`（参考提交 `7d75a0e`）
 
 ### 第 5 章：扩展机制（05-extensions/）
 **核心概念**：事件钩子、动态工具注册、自定义命令
@@ -120,6 +124,13 @@ export OPENAI_API_KEY="sk-..."
 python3 03-tools/src/main.py
 ```
 
+### 运行第 4 章（会话管理与压缩）
+```bash
+export OPENAI_API_KEY="sk-..."
+python3 04-sessions/src/main.py        # 新会话
+python3 04-sessions/src/main.py -c     # 恢复最近的会话
+```
+
 ### 运行测试（无需 API key）
 ```bash
 # 第 1 章测试
@@ -132,6 +143,9 @@ pytest 02-providers/src/test_main.py -v
 
 # 第 3 章测试
 pytest 03-tools/src/test_tools.py -v
+
+# 第 4 章测试
+pytest 04-sessions/src/test_sessions.py -v
 ```
 
 ## 学习路径
@@ -155,7 +169,7 @@ pytest 03-tools/src/test_tools.py -v
 ## 参考资料
 
 - **pi 源码**：https://github.com/earendil-works/pi
-- **参考提交**：`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`（2026-10-12）
+- **参考提交**：`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`（2026-10-12，第 1-3 章）；`7d75a0e`（第 4 章）
 - **作者博客**：https://mariozechner.at
 - **OpenAI API 文档**：https://platform.openai.com/docs/guides/function-calling
 - **Claude API 文档**：https://docs.anthropic.com/en/docs/tool-use

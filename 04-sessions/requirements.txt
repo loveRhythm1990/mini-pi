@@ -1,0 +1,4 @@
+openai>=1.54.0
+pytest>=8.0.0
+# 可选：更精确的 token 计数
+# tiktoken>=0.7.0
