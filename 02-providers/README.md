@@ -138,7 +138,8 @@ for event in stream:
 ```
 02-providers/
 ├── src/
-│   ├── main.py           # 主程序 + 统一接口
+│   ├── main.py           # 主程序，继续导出统一类型
+│   ├── messages.py       # 统一消息类型与 Provider 接口
 │   ├── openai_adapter.py # OpenAI 适配器
 │   ├── anthropic_adapter.py # Anthropic 适配器
 │   ├── test_main.py      # 单元测试
@@ -149,7 +150,7 @@ for event in stream:
 
 ### 核心代码解析
 
-#### 1. 统一的消息格式（main.py）
+#### 1. 统一的消息格式（messages.py）
 
 我们定义一套**标准消息格式**，所有适配器都转换成这个格式：
 
@@ -168,6 +169,7 @@ class Message:
     content: str | None
     tool_calls: list[ToolCall] | None
     tool_call_id: str | None  # 当 role == "tool" 时使用
+    stop_reason: str | None = None  # 后续章节用它识别模型输出截断
 ```
 
 **设计原则**：
@@ -175,7 +177,7 @@ class Message:
 - **统一类型**：`arguments` 统一是字典，避免 JSON 字符串解析
 - **简单映射**：可以轻松转换成任何厂商的格式
 
-#### 2. Provider 接口（main.py）
+#### 2. Provider 接口（messages.py）
 
 ```python
 class Provider(ABC):
@@ -186,7 +188,8 @@ class Provider(ABC):
         self,
         messages: list[Message],
         tools: list[dict],
-        stream: bool = False
+        stream: bool = False,
+        max_tokens: int | None = None
     ) -> Message | Iterator[dict]:
         """
         发送请求，返回 Message 或流式事件
@@ -195,6 +198,7 @@ class Provider(ABC):
             messages: 统一格式的消息历史
             tools: 工具定义（JSON Schema 格式）
             stream: 是否流式输出
+            max_tokens: 可选输出预算，第 5 章用来生成压缩摘要
             
         Returns:
             如果 stream=False，返回完整的 Message
@@ -214,6 +218,8 @@ class Provider(ABC):
 ```
 
 #### 3. OpenAI 适配器（openai_adapter.py）
+
+统一类型被移到 `messages.py`，便于第 5、6 章复用；原来的 `from main import Message` 仍兼容。适配器还会保留停止原因，并在摘要调用时传递输出预算。Anthropic 的 system 消息作为独立请求参数传递，同一批工具结果合并进一个后继 user 消息；OpenAI 流在消费结束或中断时关闭，缺少结束标记的流不当成完整响应。
 
 完整实现见源码。关键点：
 

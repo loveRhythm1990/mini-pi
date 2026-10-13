@@ -163,7 +163,7 @@ def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
             text=True,
             cwd=cwd,
             # 创建新进程组，方便后续终止整个进程树
-            preexec_fn=os.setsid if sys.platform != 'win32' else None
+            start_new_session=sys.platform != 'win32'
         )
         
         try:
@@ -203,17 +203,21 @@ def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
             
             return result
                 
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as interrupted:
             # 超时，终止进程树（pi 的做法）
             try:
                 if sys.platform != 'win32':
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    os.killpg(process.pid, signal.SIGTERM)
                     time.sleep(0.1)
                     # 如果还没终止，强制 kill
                     try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                        os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+                    except PermissionError:
+                        # macOS 对已经消失的进程组也可能返回 EPERM。
+                        if process.poll() is None:
+                            raise
                 else:
                     process.terminate()
                     time.sleep(0.1)
@@ -229,6 +233,9 @@ def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
                 output, _ = process.communicate(timeout=0.5)
             except:
                 output = ""
+
+            if isinstance(interrupted, KeyboardInterrupt):
+                raise  # 清理子进程后交给 CLI 处理用户中断。
             
             return (
                 output + 

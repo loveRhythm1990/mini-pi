@@ -6,7 +6,7 @@
 
 ## 课程概览
 
-本教程分为 6 个章节，每个章节都是独立可运行的 Python 代码，逐步构建一个完整的编程智能体框架：
+本教程的 6 个章节均已实现，从最小循环逐步构建带会话、扩展和 CLI 的编程智能体。每章有自己的运行入口；第 5、6 章复用前面章节，因此需要保留完整仓库目录：
 
 ### 第 1 章：Agent 主循环（01-loop/）
 **核心概念**：消息数组、工具调用、循环终止条件
@@ -62,22 +62,27 @@
 
 **对比 pi**：`session-manager.ts` 和 `compaction/`（参考提交 `7d75a0e`）
 
-### 第 5 章：扩展机制（05-extensions/）
+### 第 5 章：扩展机制（[05-extensions/](05-extensions/README.md)）✅
 **核心概念**：事件钩子、动态工具注册、自定义命令
 
-- 监听生命周期事件（turn_start、tool_call 等）
-- 动态注册工具
-- 拦截和改写工具调用
-- 斜杠命令（slash commands）
+- 接回 Provider、文件工具与会话压缩，统一执行路径
+- 动态工具注册与 JSON Schema 参数验证
+- 生命周期钩子、调用拦截、参数和结果改写、压缩取消
+- 注册斜杠命令，按文件加载扩展
+- 日志、bash 拦截、项目查看三个示例扩展
+- 中断后补齐工具结果，恢复时不自动重放
 
 **对比 pi**：`core/extensions/` 和 examples
 
-### 第 6 章：CLI 与总结（06-cli/）
+### 第 6 章：CLI 与总结（[06-cli/](06-cli/README.md)）✅
 **核心概念**：终端 UI、架构对比、权衡取舍
 
-- 简单的 TUI 实现
-- 与 pi、Claude Code、OpenHands 的对比
-- 设计哲学：为什么工具这么少？为什么不内置子 agent？
+- 交互终端、输入历史与命令补全
+- 一次性任务、stdin、流式输出、stdout/stderr 分离
+- 按项目恢复会话，处理错误、中断和退出码
+- 无需 API key 的离线演示与可执行启动器
+- 与 pi、Claude Code、OpenHands 公开架构对比
+- 设计取舍：工具数量、扩展边界与子 Agent
 
 ## 快速开始
 
@@ -87,8 +92,19 @@
 
 ### 安装依赖
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### 先运行最终版本（无需 API key）
+
+```bash
+python3 06-cli/src/main.py --demo "介绍这个项目"
+python3 06-cli/src/main.py --demo --interactive
+```
+
+离线模式使用确定性的假模型，只演示调用流程，不理解任意任务或生成真实摘要。
 
 ### 设置 API Key
 ```bash
@@ -133,6 +149,9 @@ python3 04-sessions/src/main.py -c     # 恢复最近的会话
 
 ### 运行测试（无需 API key）
 ```bash
+# 运行全部六章（独立进程，避免各章的同名 main.py 冲突）
+python3 scripts/test.py
+
 # 第 1 章测试
 pytest 01-loop/src/test_main.py -v
 # 或
@@ -146,7 +165,31 @@ pytest 03-tools/src/test_tools.py -v
 
 # 第 4 章测试
 pytest 04-sessions/src/test_sessions.py -v
+
+# 第 5 章测试
+pytest 05-extensions/src/test_extensions.py -v
+
+# 第 6 章测试
+pytest 06-cli/src/test_cli.py -v
 ```
+
+### 运行第 5、6 章
+
+```bash
+# 扩展机制演示
+python3 05-extensions/src/main.py --demo "介绍这个项目"
+
+# 连接真实模型，执行一次任务
+python3 06-cli/src/main.py "读取 README.md，说明每章实现了什么"
+
+# 恢复当前项目最近的会话
+python3 06-cli/src/main.py -c
+
+# 查看完整参数
+python3 06-cli/src/main.py --help
+```
+
+模型配置、额外扩展和管道输出见[第 6 章](06-cli/README.md)。工具直接在当前机器执行，本教程未实现沙箱和完整权限系统。
 
 ## 学习路径
 
@@ -164,12 +207,12 @@ pytest 04-sessions/src/test_sessions.py -v
 
 4. **对比 pi 源码**：看看生产级实现的细节（附 TypeScript 语法解释）
 
-5. **做练习**：每章末尾都有 2 个练习题
+5. **做练习**：每章末尾都有练习题
 
 ## 参考资料
 
 - **pi 源码**：https://github.com/earendil-works/pi
-- **参考提交**：`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`（2026-10-12，第 1-3 章）；`7d75a0e`（第 4 章）
+- **参考提交**：`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`（2026-10-12，第 1-3、5-6 章）；`7d75a0e`（第 4 章）
 - **作者博客**：https://mariozechner.at
 - **OpenAI API 文档**：https://platform.openai.com/docs/guides/function-calling
 - **Claude API 文档**：https://docs.anthropic.com/en/docs/tool-use

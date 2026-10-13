@@ -17,15 +17,26 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from prompts import (
-    BRANCH_SUMMARY_PROMPT,
-    SUMMARIZATION_PROMPT,
-    SUMMARIZATION_SYSTEM_PROMPT,
-    TURN_PREFIX_SUMMARIZATION_PROMPT,
-    UPDATE_SUMMARIZATION_PROMPT,
-)
-from session import SessionManager, entry_to_messages
-from tokens import estimate_message_tokens, estimate_messages_tokens
+try:
+    from .prompts import (
+        BRANCH_SUMMARY_PROMPT,
+        SUMMARIZATION_PROMPT,
+        SUMMARIZATION_SYSTEM_PROMPT,
+        TURN_PREFIX_SUMMARIZATION_PROMPT,
+        UPDATE_SUMMARIZATION_PROMPT,
+    )
+    from .session import SessionManager, entry_to_messages
+    from .tokens import estimate_message_tokens, estimate_messages_tokens
+except ImportError:
+    from prompts import (
+        BRANCH_SUMMARY_PROMPT,
+        SUMMARIZATION_PROMPT,
+        SUMMARIZATION_SYSTEM_PROMPT,
+        TURN_PREFIX_SUMMARIZATION_PROMPT,
+        UPDATE_SUMMARIZATION_PROMPT,
+    )
+    from session import SessionManager, entry_to_messages
+    from tokens import estimate_message_tokens, estimate_messages_tokens
 
 TOOL_RESULT_MAX_CHARS = 2000
 
