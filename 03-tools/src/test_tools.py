@@ -228,13 +228,14 @@ def test_bash_cwd():
 
 
 def test_bash_truncation():
-    """测试 bash 输出截断"""
-    # 生成大量输出（超过 20000 字符）
-    result = tool_bash("python3 -c \"print('x' * 30000)\"")
+    """测试 bash 输出截断（尾部截断）"""
+    # 生成大量行输出（超过2000行）
+    result = tool_bash("python3 -c \"for i in range(2500): print(f'Line {i:04d}')\"")
     
-    # 应该被截断
-    assert len(result) < 25000  # 包括截断提示
-    assert "截断" in result or len(result) < 30000
+    # 应该被截断（只保留尾部，2000行限制）
+    assert "截断" in result
+    assert "Line 2499" in result  # 最后一行应该在
+    assert "Line 0000" not in result  # 第一行不应该在（只保留尾部）
     
     print("✅ bash 输出截断测试通过")
 

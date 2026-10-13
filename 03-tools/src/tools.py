@@ -89,17 +89,60 @@ def tool_write(path: str, content: str) -> str:
         return f"错误: {str(e)}"
 
 
+def _truncate_tail(content: str, max_lines: int = 2000, max_bytes: int = 50 * 1024) -> tuple[str, bool, str | None]:
+    """
+    从尾部截断内容（保留最后N行/字节）
+    模拟 pi 的 truncateTail 行为：packages/coding-agent/src/core/tools/truncate.ts
+    
+    Args:
+        content: 要截断的内容
+        max_lines: 最大行数（默认2000）
+        max_bytes: 最大字节数（默认50KB）
+        
+    Returns:
+        (truncated_content, was_truncated, full_content_for_temp_file)
+    """
+    total_bytes = len(content.encode('utf-8'))
+    lines = content.split('\n')
+    total_lines = len(lines)
+    
+    # 如果不需要截断
+    if total_lines <= max_lines and total_bytes <= max_bytes:
+        return content, False, None
+    
+    # 从后向前累积行
+    output_lines = []
+    output_bytes = 0
+    
+    for i in range(len(lines) - 1, -1, -1):
+        if len(output_lines) >= max_lines:
+            break
+        
+        line = lines[i]
+        line_bytes = len(line.encode('utf-8')) + (1 if output_lines else 0)  # +1 for newline
+        
+        if output_bytes + line_bytes > max_bytes:
+            break
+        
+        output_lines.insert(0, line)
+        output_bytes += line_bytes
+    
+    truncated_content = '\n'.join(output_lines)
+    return truncated_content, True, content
+
+
 def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
     """
     执行 bash 命令（基于 pi 的实现）
     
     特性：
     - 超时控制（默认30秒）
-    - 智能输出截断（保留头部和尾部，模拟 pi 的行为）
+    - 尾部截断（保留最后2000行或50KB，先达到哪个限制就截断）
     - 合并 stdout 和 stderr
     - 报告退出码
     - 支持自定义工作目录
     - 进程树终止（超时或中断时）
+    - 截断时保存完整输出到临时文件
     
     Args:
         command: 要执行的 bash 命令
@@ -107,7 +150,7 @@ def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
         cwd: 工作目录，默认为当前目录
         
     Returns:
-        命令输出（包含退出码信息）
+        命令输出（包含退出码信息和临时文件路径）
     """
     try:
         # pi 的实现会合并 stdout 和 stderr
@@ -128,24 +171,37 @@ def tool_bash(command: str, timeout: int = 30, cwd: str | None = None) -> str:
             output, _ = process.communicate(timeout=timeout)
             exit_code = process.returncode
             
-            # pi 的输出截断策略：保留头部和尾部
-            # 参考：packages/agent/src/tool-execution.ts truncateToolOutput
-            max_chars = 20000
-            if len(output) > max_chars:
-                half = max_chars // 2
-                truncated_chars = len(output) - max_chars
-                output = (
-                    output[:half] +
-                    f"\n\n... (截断了 {truncated_chars} 字符，总共 {len(output)} 字符) ...\n\n" +
-                    output[-half:]
-                )
+            # pi 的输出截断策略：只保留尾部（2000行或50KB）
+            # 参考：packages/coding-agent/src/core/tools/truncate.ts
+            truncated_output, was_truncated, full_output = _truncate_tail(output)
+            
+            # 如果被截断，保存完整输出到临时文件
+            temp_file_path = None
+            if was_truncated and full_output:
+                import tempfile
+                fd, temp_file_path = tempfile.mkstemp(suffix='.txt', prefix='bash_output_')
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.write(full_output)
+                except:
+                    temp_file_path = None
+            
+            # 构建结果
+            result = truncated_output if truncated_output else "(命令成功执行，无输出)"
+            
+            # 添加截断提示
+            if was_truncated:
+                total_lines = len(output.split('\n'))
+                total_bytes = len(output.encode('utf-8'))
+                result += f"\n\n[输出已截断：总共 {total_lines} 行 / {total_bytes} 字节，仅显示尾部]"
+                if temp_file_path:
+                    result += f"\n[完整输出已保存到: {temp_file_path}]"
             
             # 报告退出码（pi 会在输出中标注）
-            if exit_code == 0:
-                return output if output else "(命令成功执行，无输出)"
-            else:
-                result = output if output else "(无输出)"
-                return f"{result}\n\n❌ 退出码: {exit_code}"
+            if exit_code != 0:
+                result += f"\n\n❌ 退出码: {exit_code}"
+            
+            return result
                 
         except subprocess.TimeoutExpired:
             # 超时，终止进程树（pi 的做法）

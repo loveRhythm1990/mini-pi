@@ -674,47 +674,436 @@ export function validateAndFixMessages(messages: AgentMessage[]): {
 
 mini-pi 的实现涵盖了核心功能，但 pi 还有一些高级特性值得深入了解。以下基于 pi 仓库 commit `7d75a0e3eb273dff753d49c066ea29fbe7b3b6f6` 的真实源码分析。
 
-### 1. 消息验证与自动修复
+### 1. 消息转换与修复（Message Transformation & Repair）
 
-**实际情况**：经过源码审查，pi 的消息验证主要在 **provider 层面**，而不是统一的消息验证层。
+pi 在发送消息给 provider 前，通过 `transformMessages` 函数进行多层转换和修复，确保跨provider兼容性和API合规性。
 
-**packages/ai/src/utils/transcript.ts** 中的 `normalizeContext` 函数（第50-80行）：
+**核心文件**：`packages/ai/src/api/transform-messages.ts`（commit 7d75a0e，234行）
+
+#### 修复案例 1：空内容规范化（Null Content Normalization）
+
+**问题**：手动构建的历史记录或旧会话文件可能包含 `null` 或 `undefined` 的 `content`。
+
+**pi 的修复**（第74行）：
 
 ```typescript
-export function normalizeContext(context: Context | TranscriptContext): TranscriptContext {
-  if ("messages" in context) {
-    return context;
+const normalizedMessages = messages.map((msg) => 
+  (msg.content == null ? { ...msg, content: [] } : msg)
+);
+```
+
+**TypeScript 语法说明**：
+- `msg.content == null`：使用宽松相等，同时检查 null 和 undefined
+- `{ ...msg, content: [] }`：对象展开运算符，复制所有属性并替换 content
+
+**Python 实现**：
+```python
+def normalize_content(messages: list[Message]) -> list[Message]:
+    return [
+        Message(**{**msg.__dict__, 'content': msg.content or []})
+        if msg.content is None else msg
+        for msg in messages
+    ]
+```
+
+#### 修复案例 2：非视觉模型的图像降级（Image Downgrade for Non-Vision Models）
+
+**问题**：向不支持图像的模型发送图像内容会导致 API 错误。
+
+**pi 的修复**（第35-56行）：
+
+```typescript
+function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model: Model<TApi>): Message[] {
+  if (model.input.includes("image")) {
+    return messages;  // 模型支持图像，不需要处理
   }
   
-  // 将单条消息或消息数组转换为标准格式
-  if (Array.isArray(context)) {
-    return { messages: context };
-  }
-  
-  return { messages: [context] };
+  return messages.map((msg) => {
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      return {
+        ...msg,
+        content: replaceImagesWithPlaceholder(
+          msg.content, 
+          "(image omitted: model does not support images)"
+        ),
+      };
+    }
+    
+    if (msg.role === "toolResult") {
+      return {
+        ...msg,
+        content: replaceImagesWithPlaceholder(
+          msg.content,
+          "(tool image omitted: model does not support images)"
+        ),
+      };
+    }
+    
+    return msg;
+  });
 }
 ```
 
-**关键发现**：
-- **修正声明**：pi 没有像最初表格所述的"自动修复不合规消息"的统一验证层
-- 实际上，每个 provider（OpenAI、Anthropic等）在转换消息时会进行基本的格式规范化
-- 例如 OpenAI adapter 会确保消息角色正确，但不会自动修复复杂的不合规情况（如孤立的 tool_result）
+**关键逻辑**：
+- 检查 `model.input.includes("image")`，如果支持则跳过
+- 替换用户消息和工具结果中的图像为占位文本
+- 合并连续的占位符，避免重复
 
-**Python 实现建议**：
+**Python 实现**：
 ```python
-def normalize_messages(messages: list[Message]) -> list[Message]:
-    """基本的消息格式规范化"""
-    if not messages:
-        raise ValueError("Messages list cannot be empty")
+def downgrade_images(messages: list[Message], model_supports_images: bool) -> list[Message]:
+    if model_supports_images:
+        return messages
     
-    # 确保第一条是 user 消息
-    if messages[0].role != "user":
-        messages.insert(0, Message(role="user", content="(session start)"))
-    
-    return messages
+    result = []
+    for msg in messages:
+        if msg.role in ("user", "tool") and isinstance(msg.content, list):
+            # 替换图像块为文本占位符
+            new_content = []
+            for block in msg.content:
+                if block.get('type') == 'image':
+                    new_content.append({
+                        'type': 'text',
+                        'text': '(image omitted: model does not support images)'
+                    })
+                else:
+                    new_content.append(block)
+            msg = Message(**{**msg.__dict__, 'content': new_content})
+        result.append(msg)
+    return result
 ```
 
-> **未验证**：pi 可能在 coding-agent 层有更高级的消息验证，但在 ai/agent 核心包中未找到统一的验证逻辑。
+#### 修复案例 3：Thinking Blocks 跨模型转换
+
+**问题**：不同模型的 thinking/reasoning 格式不兼容（如 OpenAI 的加密推理、Anthropic 的明文思考）。
+
+**pi 的修复**（第100-118行）：
+
+```typescript
+const transformedContent = assistantMsg.content.flatMap((block) => {
+  if (block.type === "thinking") {
+    // 加密的 thinking（redacted）只对同一模型有效
+    if (block.redacted) {
+      return isSameModel ? block : [];  // 跨模型时丢弃
+    }
+    
+    // 同模型且有签名：保留（用于重放）
+    if (isSameModel && block.thinkingSignature) return block;
+    
+    // 空的 thinking：跳过
+    if (!block.thinking || block.thinking.trim() === "") return [];
+    
+    // 跨模型：转换为普通文本
+    if (isSameModel) return block;
+    return { type: "text" as const, text: block.thinking };
+  }
+  // ... 其他类型
+});
+```
+
+**TypeScript 语法说明**：
+- `.flatMap()`：映射后展平，返回 `[]` 会被过滤掉
+- `as const`：类型断言为字面量类型
+
+**关键策略**：
+1. **加密 thinking**：只在同模型间保留
+2. **空 thinking**：直接丢弃
+3. **明文 thinking**：跨模型时转为普通文本
+
+**Python 实现**：
+```python
+def transform_thinking_blocks(
+    content: list[dict], 
+    is_same_model: bool
+) -> list[dict]:
+    result = []
+    for block in content:
+        if block.get('type') == 'thinking':
+            if block.get('redacted') and not is_same_model:
+                continue  # 跨模型丢弃加密thinking
+            if not block.get('thinking', '').strip():
+                continue  # 跳过空thinking
+            if not is_same_model:
+                # 跨模型转为文本
+                result.append({'type': 'text', 'text': block['thinking']})
+            else:
+                result.append(block)
+        else:
+            result.append(block)
+    return result
+```
+
+#### 修复案例 4：Tool Call ID 规范化（Cross-Provider ID Normalization）
+
+**问题**：OpenAI 生成的 tool call ID 长达 450+ 字符且包含特殊字符（如 `|`），而 Anthropic 要求 ID 匹配 `^[a-zA-Z0-9_-]+$` 且最多 64 字符。
+
+**pi 的修复**（第60-142行）：
+
+```typescript
+export function transformMessages<TApi extends Api>(
+  messages: Message[],
+  model: Model<TApi>,
+  normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
+): Message[] {
+  const toolCallIdMap = new Map<string, string>();
+  
+  // 第一遍：转换 tool call ID
+  const transformed = imageAwareMessages.map((msg) => {
+    if (msg.role === "assistant") {
+      const transformedContent = assistantMsg.content.flatMap((block) => {
+        if (block.type === "toolCall") {
+          let normalizedToolCall: ToolCall = toolCall;
+          
+          if (!isSameModel && normalizeToolCallId) {
+            const normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
+            if (normalizedId !== toolCall.id) {
+              toolCallIdMap.set(toolCall.id, normalizedId);  // 记录映射
+              normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
+            }
+          }
+          
+          return normalizedToolCall;
+        }
+        return block;
+      });
+    }
+    
+    // 同步更新 toolResult 的 toolCallId
+    if (msg.role === "toolResult") {
+      const normalizedId = toolCallIdMap.get(msg.toolCallId);
+      if (normalizedId && normalizedId !== msg.toolCallId) {
+        return { ...msg, toolCallId: normalizedId };
+      }
+    }
+    
+    return msg;
+  });
+}
+```
+
+**关键设计**：
+- 使用 `Map` 记录 ID 映射关系
+- 先转换 assistant 消息中的 tool call ID
+- 再同步更新对应的 tool result 中的 `toolCallId`
+
+**Python 实现**：
+```python
+def normalize_tool_call_ids(
+    messages: list[Message],
+    normalize_fn: callable
+) -> list[Message]:
+    id_map = {}
+    result = []
+    
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            new_calls = []
+            for tc in msg.tool_calls:
+                new_id = normalize_fn(tc.id)
+                if new_id != tc.id:
+                    id_map[tc.id] = new_id
+                    new_calls.append(ToolCall(**{**tc.__dict__, 'id': new_id}))
+                else:
+                    new_calls.append(tc)
+            msg = Message(**{**msg.__dict__, 'tool_calls': new_calls})
+        elif msg.role == "tool" and msg.tool_call_id in id_map:
+            # 同步更新 tool result
+            msg = Message(**{**msg.__dict__, 'tool_call_id': id_map[msg.tool_call_id]})
+        result.append(msg)
+    
+    return result
+```
+
+#### 修复案例 5：孤立 Tool Calls 的合成结果（Synthetic Results for Orphaned Tool Calls）
+
+**问题**：assistant 请求了工具调用，但后续消息中缺少对应的 tool result（可能因为中断、错误等）。
+
+**pi 的修复**（第158-233行）：
+
+```typescript
+const result: Message[] = [];
+let pendingToolCalls: ToolCall[] = [];
+let existingToolResultIds = new Set<string>();
+
+const closePendingToolCalls = () => {
+  if (pendingToolCalls.length > 0) {
+    for (const tc of pendingToolCalls) {
+      if (!existingToolResultIds.has(tc.id)) {
+        // 插入合成的空结果
+        result.push({
+          role: "toolResult",
+          toolCallId: tc.id,
+          toolName: tc.name,
+          content: [{ type: "text", text: "No result provided" }],
+          isError: true,
+          timestamp: Date.now(),
+        } as ToolResultMessage);
+      }
+    }
+    pendingToolCalls = [];
+    existingToolResultIds = new Set();
+  }
+};
+
+for (const msg of transformed) {
+  if (msg.role === "assistant") {
+    closePendingToolCalls();  // 关闭上一个 assistant 的孤立调用
+    
+    const toolCalls = assistantMsg.content.filter((b) => b.type === "toolCall");
+    if (toolCalls.length > 0) {
+      pendingToolCalls = toolCalls;
+      existingToolResultIds = new Set();
+    }
+    
+    result.push(msg);
+  } else if (msg.role === "toolResult") {
+    existingToolResultIds.add(msg.toolCallId);
+    result.push(msg);
+  } else if (msg.role === "user") {
+    closePendingToolCalls();  // 新用户消息中断工具流程
+    result.push(msg);
+  }
+}
+
+closePendingToolCalls();  // 处理末尾的孤立调用
+```
+
+**关键策略**：
+- 追踪每个 assistant 消息的 tool calls
+- 遇到新 assistant/user 消息或会话结束时，检查是否有未匹配的 tool call
+- 为每个孤立的 tool call 插入标记为错误的合成结果
+
+**Python 实现**：
+```python
+def insert_synthetic_results(messages: list[Message]) -> list[Message]:
+    result = []
+    pending_calls = []
+    existing_ids = set()
+    
+    def close_pending():
+        for tc in pending_calls:
+            if tc.id not in existing_ids:
+                result.append(Message(
+                    role="tool",
+                    content="No result provided",
+                    tool_call_id=tc.id
+                ))
+        pending_calls.clear()
+        existing_ids.clear()
+    
+    for msg in messages:
+        if msg.role == "assistant":
+            close_pending()
+            if msg.tool_calls:
+                pending_calls.extend(msg.tool_calls)
+            result.append(msg)
+        elif msg.role == "tool":
+            existing_ids.add(msg.tool_call_id)
+            result.append(msg)
+        elif msg.role == "user":
+            close_pending()
+            result.append(msg)
+        else:
+            result.append(msg)
+    
+    close_pending()
+    return result
+```
+
+#### 修复案例 6：跳过错误/中止的 Assistant 消息
+
+**问题**：错误或中止的 assistant 消息可能包含不完整内容（如只有 reasoning 没有 message、不完整的 tool calls）。
+
+**pi 的修复**（第196-203行）：
+
+```typescript
+if (msg.role === "assistant") {
+  const assistantMsg = msg as AssistantMessage;
+  
+  // 跳过错误/中止的消息
+  if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+    continue;  // 不加入结果
+  }
+  
+  // ... 正常处理
+  result.push(msg);
+}
+```
+
+**原因**：
+- 不完整的 turn 不应重放
+- 可能导致 API 错误（如 OpenAI 的 "reasoning without following item"）
+- 模型应从最后有效状态重试
+
+**Python 实现**：
+```python
+def filter_errored_messages(messages: list[Message]) -> list[Message]:
+    return [
+        msg for msg in messages
+        if not (msg.role == "assistant" and 
+                getattr(msg, 'stop_reason', None) in ('error', 'aborted'))
+    ]
+```
+
+#### 修复案例 7：System 消息的特殊处理
+
+**问题**：system 消息落在 tool call 和其结果之间会导致 API 错误（某些 provider 要求 tool result 紧跟 tool call）。
+
+**pi 的修复**（第164-186行）：
+
+```typescript
+const heldSystemMessages: Message[] = [];
+
+const closePendingToolCalls = () => {
+  // 先插入合成结果
+  for (const tc of pendingToolCalls) {
+    if (!existingToolResultIds.has(tc.id)) {
+      result.push(/* synthetic result */);
+    }
+  }
+  
+  // 再释放 held 的 system 消息
+  result.push(...heldSystemMessages);
+  heldSystemMessages.length = 0;
+};
+
+for (const msg of transformed) {
+  if (msg.role === "system") {
+    if (pendingToolCalls.length > 0) {
+      heldSystemMessages.push(msg);  // 暂存
+    } else {
+      result.push(msg);  // 直接添加
+    }
+  }
+  // ...
+}
+```
+
+**策略**：
+- 如果有 pending tool calls，暂存 system 消息
+- 在插入合成结果后才释放 system 消息
+- 确保 tool result 紧跟 tool call
+
+**Python 实现**：
+```python
+def reorder_system_messages(messages: list[Message]) -> list[Message]:
+    result = []
+    pending_calls = []
+    held_system = []
+    
+    for msg in messages:
+        if msg.role == "system" and pending_calls:
+            held_system.append(msg)
+        else:
+            if msg.role in ("assistant", "user"):
+                # 释放held的system消息
+                result.extend(held_system)
+                held_system.clear()
+            result.append(msg)
+    
+    result.extend(held_system)
+    return result
+```
 
 ### 2. 更多厂商支持（Provider Registry）
 
@@ -829,7 +1218,7 @@ def calculate_cost(usage: Usage, model: str) -> float:
     return usage.input_tokens * rate["input"] + usage.output_tokens * rate["output"]
 ```
 
-> **未验证**：具体的 compaction 算法细节需要深入研究 `packages/agent/src` 中的相关代码。
+> ⚠️ **Compaction 算法细节**：具体的消息压缩策略位于 `packages/agent/src/compaction/`，包括分支总结和上下文管理，本文未深入分析。
 
 ### 4. 中止信号（AbortSignal）全链路传递
 
@@ -911,7 +1300,7 @@ async def agent_loop_with_cancellation(provider, messages, cancel_event: asyncio
 
 > 参考：`packages/ai/src/types.ts` 第158行，`packages/agent/src/agent-loop.ts`，`packages/coding-agent/src/core/tools/bash.ts`
 
-## 总结对比表（修正版）
+## 总结对比表
 
 | 特性 | mini-pi (Python) | pi 真实实现 (TypeScript) |
 |---|---|---|
@@ -919,15 +1308,11 @@ async def agent_loop_with_cancellation(provider, messages, cancel_event: asyncio
 | OpenAI 支持 | ✅ 完整支持 | ✅ 完整支持 |
 | Anthropic 支持 | ✅ 完整支持 | ✅ 完整支持 + 扩展思维模式 |
 | 流式输出 | ✅ 支持 | ✅ 支持 + 更细粒度的事件 |
-| 消息验证 | ❌ | ⚠️ **修正**：基本规范化（非完整验证）|
+| 消息转换与修复 | ❌ | ✅ 7种修复案例（空内容、图像、thinking、ID、孤立调用、错误消息、system顺序）|
 | 更多厂商 | ❌ | ✅ 30+ providers（Google、Azure、Mistral等）+ OpenAI 兼容端点（Ollama） |
-| Token 预算管理 | ❌ | ✅ 每条消息带 usage + compaction（未完全验证）|
+| Token 预算管理 | ❌ | ✅ 每条消息带 usage；compaction 机制 ⚠️（具体算法未验证）|
 | 中止信号 | ❌ | ✅ 全链路 AbortSignal（agent → provider → fetch + tools）|
 | 代码行数 | ~400 行 Python | ~2000 行 TypeScript（ai包核心）+ ~1500 行（agent包）|
-
-**修正说明**：
-- ✅ **消息验证**：原声明"自动修复不合规消息"过于夸大。实际上 pi 只做基本的格式规范化（normalize），没有复杂的自动修复逻辑。
-- ✅ **Token 管理**：compaction 的具体实现未在本次审查中完全验证，但 Usage 类型和基本计数确实存在。
 
 ## 如何运行
 

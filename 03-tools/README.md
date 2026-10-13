@@ -643,7 +643,7 @@ function truncateToolOutput(output: string, maxChars: number = 20000): string {
 
 **pi 的应对**：在生产环境中，bash 工具会受到严格的安全限制（沙箱、权限控制）。但在开发模式下，为了灵活性，通常不做限制。
 
-> **未验证点**：pi 的具体沙箱实现细节（如是否使用 Docker、firejail 等）需要查看部署配置，代码中未找到明确的沙箱逻辑。
+> ⚠️ **沙箱实现**：pi 源码中未找到沙箱隔离的具体实现（如 Docker、firejail）。生产部署的安全策略可能在部署配置中单独处理。
 
 #### 2. 长时间运行与超时（Long-Running Processes and Timeouts）
 
@@ -727,7 +727,7 @@ Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} line
 ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first).`
 ```
 
-**关键发现**：
+**关键点**：
 1. **只保留尾部**，不保留头部：bash输出通常最后几行最重要（错误信息、最终结果）
 2. **双重限制**：2000行 **或** 50KB，哪个先达到就截断
 3. **从后向前累积**：逐行从后向前添加，直到触及任一限制
@@ -764,7 +764,7 @@ ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first).`
 - bash 工具默认与其他工具**串行执行**
 - 但可以配置为并发（如果用户确定安全）
 
-> **未验证点**：pi 的具体并发策略配置方式需要查看 agent-loop.ts 的完整实现。
+> ⚠️ **并发配置**：工具并发执行的完整策略（如最大并发数、队列管理）需查看 `agent-loop.ts` 的完整上下文。
 
 #### 6. bash 可以替代其他工具（Tool Substitution）
 
@@ -813,7 +813,7 @@ ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first).`
 - 大部分开发环境**不使用沙箱**
 - 依赖用户的**审查和确认**
 
-> **未验证点**：pi 是否在生产部署中实现了沙箱，以及具体的实现方式（Docker、VM、chroot 等）。
+> ⚠️ **生产沙箱**：生产环境的沙箱隔离可能通过部署配置（如 Docker、VM）实现，而非代码级别。
 
 ### pi 的 bash 工具完整实现（真实代码）
 
@@ -971,7 +971,7 @@ export function defineBashTool(config: BashToolConfig): ToolDefinition<BashToolI
 | 进程树终止 | ✅ killpg | ✅ spawn timeout |
 | 工作目录 | ✅ cwd 参数 | ✅ cwd 参数 |
 | 流式输出 | ❌ communicate 阻塞 | ✅ 事件流 |
-| 沙箱隔离 | ❌ | ⚠️ 未验证 |
+| 沙箱隔离 | ❌ | ⚠️ 部署层实现（代码中未体现）|
 
 ## 总结对比表
 
