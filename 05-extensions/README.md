@@ -15,7 +15,7 @@
 | 用户命令 | 怎样增加 `/project`，而不调用模型？ | `CommandRegistry` |
 | 扩展加载 | 怎样把这些行为放进单独文件？ | Python 文件中的 `setup(api)` |
 
-本章使用同步 Python，把工具串行执行；不引入异步调度、热重载和扩展包管理。pi 的源码对照固定在提交 [`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b)，不要把本章简化的事件名当成 pi 的实际 API。
+本章使用同步 Python，把工具串行执行；不引入异步调度、热重载和扩展包管理——用户如何安装配置、消息如何排队，在第六、七部分对照 pi 展开。pi 的源码对照固定在提交 [`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b)，不要把本章简化的事件名当成 pi 的实际 API。
 
 ## 先把前四章接起来
 
@@ -288,6 +288,118 @@ def setup(api):
 
 Python 扩展与宿主运行在同一进程，拥有相同的文件和网络权限。附带的 `guard_bash.py` 只是展示钩子：`rm` 的别名、脚本、参数变形和其他删除方式都可能绕过字符串匹配，它不是沙箱，也不是完整的权限策略。
 
+## 第六部分：用户视角——安装、发现与配置
+
+前面的部分都在讲“扩展怎么写”；对用户来说，第一个问题其实是“怎么装”。两个实现给出了不同复杂度的答案。
+
+### mini-pi：一个开关，三个附带示例
+
+演示入口固定先加载 `examples/` 里的三个文件，再依次加载 `-e` 给出的路径：
+
+```bash
+python3 05-extensions/src/main.py -e ./my_ext.py -e ./another.py
+```
+
+| 附带扩展 | 演示什么 | 怎么体验 |
+|---|---|---|
+| `project_info.py` | 同时注册一个模型工具和一个 `/project` 命令 | 交互模式输入 `/project`（不调模型）；或让模型自己调 `project_info` 工具 |
+| `log_calls.py` | 观察型钩子：`before_tool_call` / `after_tool_call` 记日志 | 正常使用工具；日志走 stderr（`api.report`），不混入模型输入输出 |
+| `guard_bash.py` | 决策型钩子：拦截包含 `rm ` 的 bash 调用 | 需要真实模型：让它“执行 rm -rf /tmp/test”，模型会收到拦截错误并改道 |
+
+加载顺序即钩子顺序：`-e` 的扩展注册在附带示例之后，它们的钩子也排在后面（第二部分的多扩展组合规则）。
+
+没有的东西同样明确：不扫描目录、不重载、不能运行中启停（练习 2 补这个）、没有包管理。每个扩展文件都得显式指定——教学实现里，“没有隐式行为”本身就是文档。
+
+### pi：三个来源、免编译加载、信任确认
+
+pi 的扩展从三个来源进入，用户不用改任何代码：
+
+| 来源 | 位置 | 适合 |
+|---|---|---|
+| 用户级 | `~/.pi/agent/extensions/` | 跟着人走，所有项目生效 |
+| 项目级 | 仓库里的 `.pi/extensions/` | 跟着仓库走，团队共享（提交进 Git） |
+| 命令行 | `pi --extension ./hello.ts` | 开发调试，一次性 |
+
+发现规则（[`loader.ts` L782-787](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/extensions/loader.ts#L782-L787)）：目录下的直接 `.ts` / `.js` 文件、带 `index.ts` / `index.js` 的子目录、带 `package.json` 且声明了 `"pi"` 字段的子目录，都会被加载。
+
+开发循环很顺：写一个 TypeScript 文件，`pi --extension` 加载，不需要编译步骤（pi 用 `jiti` 直接执行 TS）；改完用 `/reload` 整体重载——重载会替换整个扩展运行时，`await ctx.reload()` 之后的代码不能复用旧运行时的状态。分发则通过 [Pi packages](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/docs/packages.md)。
+
+**项目扩展要过信任关**。扩展与宿主同进程、同权限（能读文件、网络和凭据），所以项目级扩展在首次打开时会触发信任确认（[`project-trust.ts` L47](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/project-trust.ts#L47) 的 `resolveProjectTrusted`）：用户可以选择记住决定；`defaultProjectTrust` 设置能把它固化成 `ask`（默认）/ `always` / `never`；个人级和命令行扩展甚至可以通过 `project_trust` 事件替用户自动作答。这层设计对应一个现实威胁：clone 一个陌生仓库时，`.pi/extensions/` 里的代码不能自动获得执行权。
+
+## 第七部分：生产者与消费者
+
+### 事件分发的本质：宿主生产，扩展消费
+
+现在可以给这套钩子机制一个更准确的名字：**宿主是事件的生产者，扩展是消费者**。生产发生在固定时机、携带固定数据（第二部分那张流程图就是“生产线”）；消费按注册顺序进行。与直接函数调用相比，方向反了过来——宿主不知道谁在听，新增行为不需要改主循环。这就是控制反转：不是“主循环调用你的逻辑”，而是“你的逻辑订阅主循环的节拍”。
+
+消费者有两种姿态：
+
+| 姿态 | 事件 | 生产者等它吗 |
+|---|---|---|
+| 观察（notify） | `turn_start`、`turn_end`、`after_compact`、`after_tool_call` | 分发完就继续，返回值只用于结果改写 |
+| 审批（request-response） | `before_tool_call`、`before_compact` | 宿主停下来等决定：执行、拦截、替换参数、取消 |
+
+mini-pi 的分发是**同步背靠背**的：生产一条、消费一条，消费者的耗时直接加在主循环上。pi 也一样——处理器是 `await` 的，官方文档明确提醒“慢处理器会拖慢流式消费”。
+
+### mini-pi 的边界：串行世界
+
+我们的交互循环长这样：
+
+```python
+while True:
+    text = input()        # ← 生产输入：必须等 Agent 空闲
+    agent.prompt(text)    # ← 消费输入：期间用户敲什么都没用
+```
+
+`input()` 和 `prompt()` 互相等待——模型工作时用户**无法生产输入**，唯一的例外是 Ctrl+C，而它走的不是队列，是第 4 章的 abort 路径。这在教学上干净，体验上却有代价：一个长任务跑十分钟，你中途想到的补充只能干等。
+
+### pi 的两个队列：steering 与 follow-up
+
+pi 在用户（生产者）和 agent 循环（消费者）之间放了两条队列：[`agent.ts` L143-170](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/agent/src/agent.ts#L143-L170) 的 `PendingMessageQueue`（消息数组 + 模式 + `enqueue` / `peek` / `drain`），实例化为 `steeringQueue` 和 `followUpQueue`，分别由 `steer()`（L299）和 `followUp()`（L304）投递：
+
+| 队列 | 入口按键 | 语义 | 消费时机 |
+|---|---|---|---|
+| steering | 工作中输入 + `Enter` | 调整当前任务 | 当前 assistant 回合（含工具调用）结束后、下一请求前 |
+| follow-up | 工作中输入 + `Alt+Enter` | 追加新任务 | 整个 agent run 本来要结束时 |
+
+用户按键一览（[usage.md](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/docs/usage.md#change-direction)）：
+
+| 想做什么 | 按键 |
+|---|---|
+| 调整正在进行的任务 | 输入后 `Enter` |
+| 在当前任务之后追加工作 | 输入后 `Alt+Enter` |
+| 把排队的消息拿回编辑器 | `Alt+Up` |
+| 停掉当前任务 | `Escape`（排队消息一并退回编辑器） |
+
+时间线上看两个消费点：
+
+```
+user
+ │
+assistant ─┐
+tool       │  一个回合 = 一次回复 + 它的工具批次
+tool       │
+assistant ─┘
+ ◆ 回合边界：steering 消费点（agent-loop.ts L295）
+   （若队列有消息，先作为新 user 消息进入，再请求模型）
+assistant ─┐
+tool       │
+assistant ─┘
+ ◆ 回合边界：steering 消费点
+ …
+ ◆ run 结束：follow-up 消费点（agent-loop.ts L302）
+   （有排队的 follow-up 就再开一个 run；没有则真正空闲）
+```
+
+两个设计值得停下来想：
+
+1. **为什么在“回合边界”消费，而不是立刻？** 模型的回复是流式的，工具调用与结果必须配对（第 4 章）——把用户消息插进 assistant 消息和它的工具结果中间会破坏协议，插进一条流式回复的中间则谁都读不懂。回合边界是“语义完整”的最小单位；队列把“随时生产”翻译成了“在安全点消费”。
+2. **默认一次只喂一条。** 队列模式 `one-at-a-time`（默认，`settings.json` 的 `steeringMode` / `followUpMode`，可改 `all`）：每回合只送出队首那条。用户排队三条补充，模型每轮先消化第一条、给出反应，再收下一条——避免三条一起砸进去，模型只回应最后一条、前两条被淹没。
+
+abort 的处理也顺理成章：`Escape` 中止时，队列里没消费的消息全部退回编辑器（[interactive-mode.ts L3072](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3072)）——没说出口的话，不该凭空消失。
+
+mini-pi 不实现队列，不是偷懒：它需要的并发（线程或事件循环）会让本章每个示例都先讲锁。练习 3 给出了最小可行版本。
+
 ## 对比 pi 的真实实现（TypeScript）
 
 ### 1. 注册表与扩展宿主
@@ -327,6 +439,8 @@ pi 的 [扩展文档：工具暴露与激活](https://github.com/earendil-works/
 | 工具集合 | 注册后全部可见 | 暴露策略、激活集合、动态发现 |
 | 生命周期与 UI | 同步函数 | 异步、会话上下文和终端 UI 能力 |
 | 重载与分发 | 未实现 | 扩展重载、包和发现机制 |
+| 安装与发现 | `-e` 显式加载 + 附带示例 | 用户/项目目录自动发现、`--extension`、包分发、`/reload` |
+| 忙碌时的输入 | 串行等待（input 与 prompt 互斥） | steering / follow-up 双队列，回合边界消费，abort 退回编辑器 |
 
 关于错误处理和加载方式，可继续阅读 [pi 扩展文档](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/docs/extensions.md)。
 
@@ -347,6 +461,14 @@ python3 05-extensions/src/main.py --demo
 ```
 
 离线演示总是先调用项目查看工具，再输出结果，不会理解用户的任意任务，也不生成真实摘要。
+
+### 试用扩展（离线）
+
+启动 `--demo` 交互模式后，可以逐个验证三个附带扩展：
+
+- 输入 `/project`：立即输出目录列表，全程不调模型——这是“命令属于用户”（第四部分）
+- 输入任意任务（如“介绍这个项目”）：假模型会先调 `project_info` 工具；留意屏幕上的 `[扩展日志]` 两行——那是 `log_calls` 在 `before_tool_call` / `after_tool_call` 里打的（走 stderr）
+- 拦截演示需要真实模型：`python3 05-extensions/src/main.py "运行 rm -rf /tmp/mini-pi-demo"`——`guard_bash` 会拦下这条命令，模型收到错误结果后通常改道或解释原因
 
 连接模型：
 
@@ -388,6 +510,12 @@ python3 -m pytest 05-extensions/src/test_extensions.py -v
 给每个注册项记录来源，用 `/extensions` 查看状态，用 `/disable <name>` 停用该扩展的处理器和工具。
 
 验证：停用之后新请求不再声明它的工具；已保存的工具结果仍能恢复。内置命令不能被扩展覆盖；停用发生在一个工具批次结束后，避免模型刚请求的工具突然消失。
+
+### 练习 3：最简 steering 队列
+
+用 `threading` 和 `queue.Queue` 给本章入口加一条 steering 队列：主线程跑 `input()` 生产消息，Agent 在独立线程消费；消费点放在“下一次调用 Provider 之前”（`prompt()` 工具循环的每轮开头），与 pi 的回合边界一致。
+
+验证：任务执行中输入补充说明，模型在下一个回合看到它；Ctrl+C 中止时，队列里未消费的消息退回提示。注意两点：`ExtensionAPI.results` 的事件分发不是线程安全的，跨线程调用需要加锁或改回主线程执行；消费点不要落在工具批次中间，否则破坏第 4 章的配对协议。
 
 ## 下一步
 
