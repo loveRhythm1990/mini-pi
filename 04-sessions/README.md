@@ -188,6 +188,83 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 
 `_appendEntry` 同时更新三样东西：`fileEntries` 数组、`byId` 索引（`Map` 相当于 Python 的 `dict`），以及 **`leafId` 指针**。
 
+### 持久化粒度：turn 不是原子单位
+
+先把三个词的层级对齐：一个 **session** 包含多个 **turn**（从一条 user 消息开始，到模型不再调用工具为止）；一个 turn 内部穿插若干条 assistant 消息和工具结果。**JSONL 的行对应消息，不是 turn**：
+
+| 对象 | 是否对应一行 | 说明 |
+|---|---|---|
+| turn | ❌ | 文件里没有 turn 容器；边界按“user 消息出现的位置”推导（第二部分选切点用的就是这个） |
+| user 消息 | ✅ | 输入即落盘 |
+| assistant 消息 | ✅ | 流式输出结束（或被打断）时落盘 |
+| 工具调用（toolCall） | ❌ | 嵌在 assistant 那一行的 `content` 数组里，并发调用也不拆行 |
+| 工具结果（toolResult） | ✅ 每个一行 | 行内 `toolCallId` 唯一，执行完一个写一行 |
+
+pi 把持久化钩子挂在每条消息的 `message_end` 事件上——**一完成就追加，不等 turn 结束**：
+
+```ts
+// packages/coding-agent/src/core/agent-session.ts L1148-1165（节选）
+		if (event.type === "message_end") {
+			let entryId: string | undefined;
+			// ...custom 消息走 appendCustomMessageEntry...
+			} else if (
+				event.message.role === "system" ||
+				event.message.role === "user" ||
+				event.message.role === "assistant" ||
+				event.message.role === "toolResult"
+			) {
+				// Regular LLM message - persist as SessionMessageEntry
+				entryId = this.sessionManager.appendMessage(event.message);
+			}
+```
+
+一个“两个并行工具调用 + 总结回复”的 turn，在文件里展开就是 5 行：
+
+```jsonl
+{"type":"message","message":{"role":"user","content":"找出所有 TODO"},...}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"grep",...},{"type":"toolCall","id":"c2","name":"read",...}]},...}
+{"type":"message","message":{"role":"toolResult","toolCallId":"c1",...},...}
+{"type":"message","message":{"role":"toolResult","toolCallId":"c2",...},...}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"共 3 处 TODO…"}]},...}
+```
+
+对 pi 的一个真实会话文件（约 370 KB）做一次解剖，观测值逐条印证：
+
+| 统计项 | 观测值 |
+|---|---|
+| 总行数 | 154 = 1 header + 151 message + 1 `model_change` + 1 `thinking_level_change` |
+| message 的 role 分布 | system 1 / user 7 / assistant 73 / toolResult 79 |
+| 每条 assistant 内 toolCall 数 | 0 个 9 条；1 个 48 条；2 个 16 条 |
+| toolResult 的 `toolCallId` | 79 行互不重复 |
+| 平均行大小 | ≈ 2.4 KB |
+
+7 条 user 消息 = 7 个 turn；16 条“一行嵌两个 toolCall”的 assistant 消息说明并发调用不拆行；`model_change` / `thinking_level_change` 是不进上下文的记账行（见上文 entry 类型表）。这个粒度的直接收益是**崩溃损失以一行为界**：turn 处理到任意位置进程死亡，已完成的消息全部完好——这正是“恢复会话”成立的根基，也是下文讨论中断恢复的前提。
+
+### 文件会膨胀吗？
+
+逐行追加意味着文件**只涨不缩**，但先区分两个概念：
+
+- **上下文大小 ≠ 文件大小**。每个请求都要把当前上下文完整重发给模型（无状态 API），token 开销随轮次增长——但那是请求的成本，不是文件的成本。文件里每条消息只存一份：第 50 轮请求重发了前 49 轮的内容，文件不会为此多出任何一行
+- **压缩（第二部分）只缩小“发给模型什么”，不缩小文件**。compaction entry 追加一行，被总结的旧消息原样留在文件里——这是刻意设计，`/branch` 回到“被压缩掉”的历史仍然可行
+
+体积本身也不容易失控。一行 ≈ 内容 + 约 100 字节元数据（`id` / `parentId` / `timestamp`），大头是工具输出，而工具输出有硬截断兜底——pi 把 bash 输出截到“最后 2000 行或 50 KB”（先到为准），完整输出另存临时文件：
+
+```ts
+// packages/coding-agent/src/core/tools/truncate.ts L11-12
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
+```
+
+（mini-pi 第 3 章的对应实现是截尾 4000 字符。）即便模型手滑跑了输出巨大的命令，文件里也只多 50 KB。按上面的实测数据折算，一个重度半天的会话约 1–3 MB，纯文本逐行加载一两秒内完成——膨胀是线性 O(n) 的，量级完全可控。
+
+那为什么不在压缩后**重写文件**、删掉已被总结的旧消息？三个理由：
+
+- 重写是 O(n) IO，而且**写到一半崩溃 = 文件损坏**，丢掉的是整个文件，而不是一行
+- append-only 换来：每步写入 O(1)、崩溃时最多坏最后一行、`tail` / `grep` / `jq` 直接可用
+- 树形分支要求旧 entry 永远存在——回到三天前的任意一点，需要那三天的历史“还在”
+
+文件真的太大时的逃生通道：pi 的 `/fork` 把当前分支抽成一个**新文件**，只携带从根到目标 entry 的分支路径，`parentId` 链重新连接，header 里记 `parentSession` 指回原文件（`session-manager.ts` L1632 的 `createBranchedSession`）；会话本来就按项目目录分文件存；想清理直接删 `.jsonl` 即可。真到归档敏感的场景，纯文本 JSON 用 gzip 还能再压一个量级——pi 选择明文是为了可调试性。
+
 ### 树和分支
 
 每个 entry 的 `parentId` 指向它的上一条。正常对话时是一条直线；但用户可以回到任意历史 entry 重新开始：
@@ -309,6 +386,89 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 `try { ... } catch { return null; }` 等价于 Python 的 `try: ... except Exception: return None`。`as FileEntry` 是类型断言，只告诉编译器"把它当作 FileEntry"，运行时什么都不做。
 
 pi 提供 `SessionManager.create()`（新建）、`SessionManager.open(path)`（打开指定文件）、`SessionManager.continueRecent(cwd)`（恢复该目录下最近的会话，即命令行的 `pi -c`）。
+
+### 中断与崩溃恢复
+
+把粒度和落盘时机串起来，就可以回答一个用户级问题：**turn 处理到一半被打断（Ctrl+C、断电）时，会话处于什么状态？恢复后哪些工作需要重来？**分两种场景。（pi 的 TUI 里中断请求的按键是 Escape；Ctrl+C 默认只清空输入框、双击才退出——无论哪种信号，落到会话层都是同一套 abort 路径。）
+
+**场景一：优雅中断（进程还活着）**
+
+pi 的 abort 是一条“结算”路径，每个环节都留下完整记录：
+
+1. **正在流式生成的 assistant 消息定格落盘**：内容停在当前位置，`stopReason` 记为 `"aborted"`，错误信息一并保存。半截话也是历史，下一次请求模型能看到自己上次说到哪里：
+
+```ts
+// packages/ai/src/api/anthropic-messages.ts L920-927（节选）
+		} catch (error) {
+			for (const block of output.content) {
+				delete (block as { index?: number }).index;
+				// partialJson is only a streaming scratch buffer; never persist it.
+				delete (block as { partialJson?: string }).partialJson;
+			}
+			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			stream.push({ type: "error", reason: output.stopReason, error: output });
+```
+
+2. **正在执行的工具收到中止信号，产生合成的错误结果并落盘**。默认的并行批里，尚未轮到的调用也补上同一个结果——保证每个 `toolCall` 都有配对的 `toolResult`：
+
+```ts
+// packages/agent/src/agent-loop.ts L619-625（并行批：尚未轮到的调用不会悬空）
+			finalizedCalls.push(async () => {
+				if (signal?.aborted) {
+					const finalized = {
+						toolCall,
+						result: createErrorToolResult("Operation aborted"),
+						isError: true,
+					} satisfies FinalizedToolCallOutcome;
+```
+
+（调用准备阶段前后还有两处同样的检查，`agent-loop.ts` L741、L760。注意一个例外：pi 的顺序执行模式在中止时只 `break` 循环（L576-579），尚未开始的调用不补结果，悬空同样可能发生。）
+
+3. **主循环放弃本轮，什么都不自动重放**：
+
+```ts
+// packages/agent/src/agent-loop.ts L245-253（节选）
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				...
+				await emit({ type: "turn_end", message, toolResults: [] });
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+```
+
+所以优雅中断后，会话文件是“**协议完整、任务半途**”的状态——结构上没有缺口，turn 做到哪算哪。系统不替你重做任何事：继续、重做还是放弃，由用户的下一个 prompt 决定。pi 在切换、新建、fork 会话前也会先等结算完成，正是为了保证“被打断的 turn（包括工具结果）已经持久化”（`agent-session-runtime.ts` L168 注释：*Settle any active response first so the aborted turn (including tool results) is persisted to the outgoing session before it is replaced.*）。
+
+**场景二：硬崩溃（kill -9 / 断电，没有 abort 机会）**
+
+已落盘的消息都在；正在流式生成的那条 assistant **整个丢失**（那次请求的 tokens 白花）；正在写的那行可能损坏，读取时按上一节的 `parseSessionEntryLine` 跳过。真正的结构风险在这样一个窗口：
+
+```
+|← assistant（带 toolCall）已落盘 →|← 崩溃窗口 →|← toolResult 尚未落盘 →|
+```
+
+恢复后文件尾部留下**悬空调用**。OpenAI 和 Anthropic 的 API 都要求 tool 结果紧跟发起调用的 assistant 消息（第二部分切点规则也是出于这个原因），直接把悬空调用投影到上下文会被 API 拒绝。而且仅凭文件**无法区分**工具是“根本没执行”还是“执行了、结果没写进来”——自动重放可能重复写文件、重复提交、重发请求。
+
+所以两个实现共同的恢复策略是**补“结构”，不重放“执行”**：
+
+- pi 的优雅路径通过“结算时补结果”从源头避免悬空；硬崩溃留下的残骸同样只能靠补齐结构来修复，而不是靠重放
+- mini-pi 第 5 章把这个策略写成了 `repair_pending_results()`：启动时和每轮中断时扫描上下文，为未配对的 toolCall 追加合成错误结果——“本轮中断；执行中的工具可能已有副作用，请先检查实际状态”。只补文件**尾部**的未配对调用，中间出现错乱直接报错，不做猜测性重排
+
+（另一层对比：pi 默认并行批、中止时现补；mini-pi 第 5 章的工具是逐个顺序执行的，不指望“中止时刚好补全”，而是把统一补齐放在 Agent 的启动步骤和每轮的异常路径里——顺带盖住了顺序批中止的悬空问题。）
+
+补充一个值得单独强调的细节：与“补齐对话结构”相对，“重复执行”永远被排除在外——即使悬空的调用其实从未执行，补齐也只会在结果里如实报告中断，由模型和用户决定是否重新发起。恢复的安全性来自“默认不重放”的克制，而不是假设工具幂等。
+
+上述真实会话文件里恰好能同时观察到三类“事故痕迹”：
+
+| 文件中的痕迹 | 含义 |
+|---|---|
+| 一条 `stopReason: "aborted"` 的空 assistant 消息 | 一次被中止的尝试（内容还没流出一个字），改口重发的消息接在它后面，两次都留在文件里 |
+| 三条 `stopReason: "error"` 的空消息（503×2、429×1） | API 失败被完整记录，紧随其后的是自动重试的成功回复 |
+| 文件尾部一个没有结果的 toolCall | 解剖文件那一刻**正在执行中**的调用——结果要等工具跑完才落盘 |
+
+空的 aborted / error 消息在 pi 的 Anthropic 适配器投影时会被跳过（`anthropic-messages.ts` L1484 的 `if (blocks.length === 0) continue;`）——留在文件里是历史，出现在请求里是幽灵。turn 的“最后一致状态”就是最后一条成功落盘的消息，**JSONL 的每一行都是一个检查点**。pi 重启后只会提示“上次崩溃”（建议 `/bug` 上报），会话本身要用 `pi -c` / `/resume` 显式恢复。
+
+**本教程的实现边界**：第 4 章的 `main.py` 已按消息逐条落盘——Ctrl+C 打断 `prompt()` 时，已完成的消息不会丢；但还没有悬空调用的补齐逻辑，断在上面的窗口里的话，恢复后投影会触发 API 报错；交互层的 `except (EOFError, KeyboardInterrupt)` 只负责退出循环。补齐作为 Agent 的启动步骤在第 5 章 `agent.py` 实现。
 
 ### 从 entry 投影出 LLM 上下文
 
@@ -1028,12 +1188,81 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 - **增量更新而非重新总结**：第二次压缩时，旧摘要 + 新消息 → 新摘要。旧的原始消息早已不在上下文里，没法"重新总结全部历史"
 - **文件操作追踪**：摘要末尾会追加 `<read-files>` / `<modified-files>` 列表（从 read/write/edit 工具调用中提取，并从上一次压缩的 `details` 继承），这部分不依赖 LLM，保证不丢
 
-### 压缩之后
+### 压缩之后：产物落盘，投影复用
 
-`compact()` 返回 `{ summary, firstKeptEntryId, tokensBefore, details }`，SessionManager 把它追加为一个 `compaction` entry。**旧消息不删除**，下一次 `buildContextEntries` 自动把上下文投影成"摘要 + 保留区 + 新消息"。另外两个保护：
+提示词决定了请求端的样子；真正值得一问的是**这笔请求换回来的是什么**。沿着一笔具体的数据流走一遍。
 
-- 如果分支的最后一个 entry 已经是 compaction，`prepareCompaction` 直接返回（避免连续压缩）
-- 摘要请求如果因为输出上限被截断（`stopReason === "length"`），抛错而不是保存一份残缺的摘要
+假设会话里已积累 120K tokens 的原始消息（编号 e1~e11），估算 120K > 阈值 111K，压缩触发，`find_cut_point` 选出切点 `e9`。摘要模型收到一次普通请求（输入就是上面描述的 `<conversation>` 序列化文本），返回的东西——即**压缩产物**——是一份几 KB 的固定格式 markdown 文档：
+
+```markdown
+## Goal
+- 修复 test_main.py 中的两个测试失败
+
+## Constraints & Preferences
+- 不修改公共 API
+
+## Progress
+### Done
+- [x] 通读 test_main.py 和 main.py
+- [x] 定位第一个失败：add() 未处理负数
+
+### In Progress
+- [ ] 修复第二个失败
+
+## Key Decisions
+- **修复放在 _normalize()**: 保持公共 API 不变
+
+## Next Steps
+1. 补 _normalize() 的边界分支
+2. 重跑 pytest
+
+## Critical Context
+- 报错信息: AssertionError: add(-1, 1) == 0 failed
+- 相关实现在 src/main.py L40-64
+```
+
+产物不是什么数据结构，也没有别的附件——**就是这么一段字符串，加上代码算好的切点坐标**。它立刻落盘，追加成一行：
+
+```jsonl
+{"type":"compaction","id":"cf9a1b2c","parentId":"e11","timestamp":"...",
+ "summary":"## Goal\n- 修复 test_main.py……（上文全文）",
+ "firstKeptEntryId":"e9","tokensBefore":120428}
+```
+
+两个字段各司其职：`summary` 是模型的“浓缩记忆”，`firstKeptEntryId` 声明“从哪段原文起继续原样保留”。**e1~e8 的原始消息一行都没删**（对照第一部分“文件会膨胀吗”：压缩缩小的是发给模型的内容，不是账本本身）。`compact()` 返回的字典还附带 `tokensAfter`——投影重算一次上下文得到的“压缩后尺寸”，仅用于日志展示。
+
+“复用”说的正是接下来这件事。下一次——以及之后的每一次——请求模型，投影出的消息数组长这样：
+
+```
+[
+  system    系统提示词
+  user      "The conversation history before this point was compacted…
+            <summary>…compaction entry 的 summary 字段原文…</summary>"
+  assistant e9 的消息原文      ┐
+  tool      e10 的结果原文      ├ 保留区（e9 起）
+  assistant e11 的消息原文     ┘
+  user      新输入
+]
+```
+
+这个数组就是“上下文投影”：每次请求前现拼，拼完即弃。但**数组里每个元素的正文在盘上都有归属**——摘要来自 compaction entry 的 `summary` 字段，其余消息来自原始 entry。所以投影从来不需要存盘：它是账本的“读取结果”，不是需要记下的“新事实”。
+
+把三个容易混淆的角色排个座次，纪律就立住了：
+
+| 角色 | 何时发生 | 成本 |
+|---|---|---|
+| 压缩动作（一次摘要 LLM 调用） | 只在上下文再次过阈值的瞬间 | 一次 API 调用 |
+| 压缩产物（compaction entry） | 跟着压缩动作写一次 | 一行 append，此后终身复用 |
+| 上下文投影（消息数组） | 每次请求前 | 拼 JSON 的微秒级开销，零 API 调用 |
+
+压缩是**稀有事件**。以 128K 窗口、默认保留 20K 计，压缩刚结束时上下文只剩“摘要 + 保留区”约 30K，要再攒 8 万多新 token 才会碰到第二次阈值；两次压缩之间的所有请求——几十轮对话、成百上千次工具调用——复用的都是同一行 compaction entry。第二次触发时改用增量更新提示词（旧摘要 + 新消息 → 合并出新摘要），旧 entry 仍在文件里，但投影只认路径上**最新**的那条。
+
+一句话：**菜谱记账一次，每次做菜按菜谱现炒，炒好的菜上桌即弃。**
+
+这个机制还有两个附带保护：
+
+- 如果分支的最后一个 entry 已经是 compaction，`prepare_compaction` 直接返回（避免连续压缩）
+- 摘要请求如果因为输出上限被截断（`finish_reason == "length"`），抛错而不是保存一份残缺的摘要
 
 ---
 
@@ -1158,6 +1387,8 @@ class Agent:
 | entry 类型 | 11 种 | message / compaction / branch_summary / model_change |
 | 延迟落盘 | 有对话才创建文件 | 立即创建 |
 | 恢复 | `open` / `continueRecent` | `open` / `continue_recent` |
+| 持久化粒度 | 消息级：`message_end` 后即追加，turn 非原子单位 | 同 |
+| 中断恢复 | 优雅中止时定格半截消息、补 `Operation aborted` 结果；硬崩溃留下悬空由补齐修复，绝不重放 | 第 4 章未实现；第 5 章 `repair_pending_results()` 启动/中断时补齐 |
 | 阈值 | `contextTokens > contextWindow - reserveTokens` | 同 |
 | 默认值 | reserveTokens 16384，keepRecentTokens 20000 | 同 |
 | token 来源 | 真实 usage + chars/4 估算 | CJK 感知估算（可选 tiktoken） |

@@ -54,6 +54,7 @@
 - JSONL 格式存储（header + 只追加的 entry）
 - 基于 id/parentId 的树形结构，leaf 指针与分支
 - 恢复会话、从 entry 投影出 LLM 上下文
+- 消息级持久化与事故恢复：turn 非原子单位，aborted 半截消息、API 错误留痕，悬空调用补结果而不重放（第 5 章实现补齐）
 - 上下文压缩：阈值 / 溢出 / 手动 `/compact` 三种触发
 - 切点选择（不拆开 tool 调用与结果）、split turn、增量更新摘要、分支摘要
 - CJK 感知的 token 估算（chars/4 会低估中文）
