@@ -12,6 +12,7 @@ from extensions import ExtensionAPI
 from previous import CompactionSettings, ROOT, SessionManager
 from providers import make_provider
 from registry import CommandRegistry, builtin_tools
+from skills import load_skills, register_skill_command, skills_prompt
 from ui import Renderer, make_reader
 
 
@@ -39,6 +40,9 @@ def parse_args(argv=None):
     parser.add_argument("--keep-recent-tokens", type=int, default=20000)
     parser.add_argument("-e", "--extension", action="append", default=[], help="加载 Python 扩展，可重复")
     parser.add_argument("--no-extensions", action="store_true", help="不加载教程附带的三个示例扩展")
+    parser.add_argument("--skills-dir", action="append", default=[],
+                        help="追加 Skill 目录，可重复；默认自动扫描项目与用户的 .mini-pi/skills")
+    parser.add_argument("--no-skills", action="store_true", help="不加载 Skill")
     args = parser.parse_args(argv)
     if args.max_steps <= 0 or args.context_window <= 0 or args.reserve_tokens < 2 or args.keep_recent_tokens <= 0:
         parser.error("步数、窗口和保留预算必须为正数，预留预算至少为 2")
@@ -125,11 +129,23 @@ def main(argv=None):
                 api.load(str(ROOT / "05-extensions" / "examples" / name))
         for path in args.extension:
             api.load(path)
+        if args.no_skills:
+            skill_dirs = []
+        else:  # 与 pi 的层次对应：项目级 .pi/skills + 用户级 ~/.pi/agent/skills
+            skill_dirs = [d for d in (Path.cwd() / ".mini-pi" / "skills",
+                                      Path.home() / ".mini-pi" / "skills") if d.is_dir()]
+            skill_dirs += [Path(d) for d in args.skills_dir]
+        skills, skill_warnings = load_skills(skill_dirs)
+        for warning in skill_warnings:
+            renderer.note(f"⚠️  {warning}")
+        if skills:
+            renderer.note(f"Skill：{', '.join(s.name for s in skills)}（/skill <名字> 强制加载）")
+        register_skill_command(commands, skills)
         session = open_session(args, Path.cwd())
         agent = Agent(provider, session, api, context_window=args.context_window,
                       settings=CompactionSettings(reserve_tokens=args.reserve_tokens,
                                                   keep_recent_tokens=args.keep_recent_tokens),
-                      notify=renderer.event)
+                      notify=renderer.event, system_suffix=skills_prompt(skills))
         renderer.note(f"会话：{session.path} | 模型：{provider.model}")
         if not interactive:
             return run_turn(agent, task, renderer, args.max_steps, stream)[0]

@@ -18,17 +18,19 @@ class TurnResult:
 
 class Agent:
     def __init__(self, provider, session, extensions, *, context_window=128000,
-                 settings=None, notify=None):
+                 settings=None, notify=None, system_suffix=""):
         self.provider = provider
         self.session = session
         self.extensions = extensions
         self.context_window = context_window
         self.settings = settings or CompactionSettings()
         self.notify = notify or (lambda event: None)
+        self.system_suffix = system_suffix  # 运行期追加的系统提示（第 6 章的 <skills> 清单）
         self.repair_pending_results()
 
     def context_records(self):
-        return [{"role": "system", "content": SYSTEM_PROMPT}] + self.session.build_context()
+        prompt = SYSTEM_PROMPT + ("\n\n" + self.system_suffix if self.system_suffix else "")
+        return [{"role": "system", "content": prompt}] + self.session.build_context()
 
     def repair_pending_results(self, reason="之前的工具批次未完成；未自动重放，请先检查实际状态"):
         """崩溃或中断后补齐未返回的结果，绝不重新执行有副作用的工具。"""

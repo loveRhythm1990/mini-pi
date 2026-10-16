@@ -6,7 +6,7 @@
 
 ## 课程概览
 
-本教程前 6 章均已实现，从最小循环逐步构建带会话、扩展和 CLI 的编程智能体；第 7 章讨论 Harness 的设计取舍与验证。前 6 章有自己的运行入口；第 5、6 章复用前面章节，因此需要保留完整仓库目录：
+本教程前 7 章均已实现，从最小循环逐步构建带会话、扩展、Skill 和 CLI 的编程智能体；第 8 章讨论 Harness 的设计取舍与验证。前 7 章有自己的运行入口；第 5～7 章复用前面章节，因此需要保留完整仓库目录：
 
 ### 第 1 章：Agent 主循环（01-loop/）
 **核心概念**：消息数组、工具调用、循环终止条件
@@ -76,7 +76,20 @@
 
 **对比 pi**：`core/extensions/` 和 examples
 
-### 第 6 章：CLI 与总结（[06-cli/](06-cli/README.md)）✅
+### 第 6 章：Skill 系统（[06-skills/](06-skills/README.md)）✅
+**核心概念**：渐进式披露、描述即路由、按需装载的指令
+
+- 行为（扩展）与知识（Skill）的分界；需求→机制版图
+- SKILL.md 规范形态：frontmatter 校验、重名先到先得、捆绑脚本目录
+- 启动只挂「名字+描述」清单，全文由模型用 read 工具自取
+- `/skill <名字> [请求]` 强制加载；`disable-model-invocation` 三态控制
+- Agent 增加 `system_suffix` 注入点：系统提示也是宿主组装的产物
+
+**代码量**：~150 行 Python（不含入口与测试）
+
+**对比 pi**：`docs/skills.md` 与 Agent Skills 规范（agentskills.io，与 Claude Code 通用）
+
+### 第 7 章：CLI 与总结（[07-cli/](07-cli/README.md)）✅
 **核心概念**：终端 UI、架构对比、权衡取舍
 
 - 交互终端、输入历史与命令补全
@@ -86,7 +99,7 @@
 - 与 pi、Claude Code、OpenHands 公开架构对比
 - 设计取舍：工具数量、扩展边界与子 Agent
 
-### 第 7 章：Harness——设计思路、取舍与验证（[07-harness/](07-harness/README.md)）
+### 第 8 章：Harness——设计思路、取舍与验证（[08-harness/](08-harness/README.md)）
 **核心概念**：上下文与行动、代码理解、可靠性与评估
 
 - 区分 Prompt、上下文、Harness 与工具执行
@@ -113,8 +126,8 @@ pip install -r requirements.txt
 ### 先运行最终版本（无需 API key）
 
 ```bash
-python3 06-cli/src/main.py --demo "介绍这个项目"
-python3 06-cli/src/main.py --demo --interactive
+python3 07-cli/src/main.py --demo "介绍这个项目"
+python3 07-cli/src/main.py --demo --interactive
 ```
 
 离线模式使用确定性的假模型，只演示调用流程，不理解任意任务或生成真实摘要。
@@ -162,7 +175,7 @@ python3 04-sessions/src/main.py -c     # 恢复最近的会话
 
 ### 运行测试（无需 API key）
 ```bash
-# 运行全部六章（独立进程，避免各章的同名 main.py 冲突）
+# 运行全部七章（独立进程，避免各章的同名 main.py 冲突）
 python3 scripts/test.py
 
 # 第 1 章测试
@@ -183,26 +196,32 @@ pytest 04-sessions/src/test_sessions.py -v
 pytest 05-extensions/src/test_extensions.py -v
 
 # 第 6 章测试
-pytest 06-cli/src/test_cli.py -v
+pytest 06-skills/src/test_skills.py -v
+
+# 第 7 章测试
+pytest 07-cli/src/test_cli.py -v
 ```
 
-### 运行第 5、6 章
+### 运行第 5～7 章
 
 ```bash
 # 扩展机制演示
 python3 05-extensions/src/main.py --demo "介绍这个项目"
 
+# Skill 系统演示（离线剧本：清单注入 → read 全文 → 按指令作答）
+python3 06-skills/src/main.py --demo "帮我对仓库做一次发布检查"
+
 # 连接真实模型，执行一次任务
-python3 06-cli/src/main.py "读取 README.md，说明每章实现了什么"
+python3 07-cli/src/main.py "读取 README.md，说明每章实现了什么"
 
 # 恢复当前项目最近的会话
-python3 06-cli/src/main.py -c
+python3 07-cli/src/main.py -c
 
 # 查看完整参数
-python3 06-cli/src/main.py --help
+python3 07-cli/src/main.py --help
 ```
 
-模型配置、额外扩展和管道输出见[第 6 章](06-cli/README.md)。工具直接在当前机器执行，本教程未实现沙箱和完整权限系统。
+模型配置、额外扩展、Skill 目录和管道输出见[第 7 章](07-cli/README.md)。工具直接在当前机器执行，本教程未实现沙箱和完整权限系统。
 
 ## 学习路径
 

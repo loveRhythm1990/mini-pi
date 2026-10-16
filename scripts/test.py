@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
-chapters = ["01-loop", "02-providers", "03-tools", "04-sessions", "05-extensions", "06-cli"]
+chapters = ["01-loop", "02-providers", "03-tools", "04-sessions", "05-extensions", "06-skills", "07-cli"]
 for chapter in chapters:
     print(f"\n{chapter}", flush=True)
     result = subprocess.run([sys.executable, "-m", "pytest", f"{chapter}/src", "-q"], cwd=root)

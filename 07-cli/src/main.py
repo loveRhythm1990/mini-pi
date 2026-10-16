@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""运行方式：python3 06-cli/src/main.py [任务]。"""
+"""运行方式：python3 07-cli/src/main.py [任务]。"""
 
 from cli import main
 

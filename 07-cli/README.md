@@ -1,4 +1,4 @@
-# 第 6 章：CLI 与总结
+# 第 7 章：CLI 与总结
 
 ## 核心概念
 
@@ -24,7 +24,7 @@
 ## 文件结构
 
 ```
-06-cli/
+07-cli/
 ├── mini-pi                 # 可执行的轻量启动器
 ├── src/
 │   ├── bootstrap.py        # 导入第 5 章核心
@@ -65,7 +65,7 @@ Agent 通过 `notify(event)` 发出展示事件；它不导入 Rich 或 `prompt_
 ### 给出任务，就执行一次
 
 ```bash
-python3 06-cli/src/main.py "读取 README.md，概括项目结构"
+python3 07-cli/src/main.py "读取 README.md，概括项目结构"
 ```
 
 完成后退出。成功时退出码为 0；API 错误、扩展加载失败或达到最大步数时返回 1。
@@ -73,7 +73,7 @@ python3 06-cli/src/main.py "读取 README.md，概括项目结构"
 `--print` 明确表达一次性模式，也允许从 stdin 读取任务：
 
 ```bash
-printf '%s\n' '读取 README.md，概括项目结构' | python3 06-cli/src/main.py --print
+printf '%s\n' '读取 README.md，概括项目结构' | python3 07-cli/src/main.py --print
 ```
 
 CLI 先读完 stdin，拼成一次用户请求，再执行。它不把每一行当成一个独立 turn。空的 stdin 直接正常退出，不创建会话，也不调用模型。
@@ -81,13 +81,13 @@ CLI 先读完 stdin，拼成一次用户请求，再执行。它不把每一行�
 ### 没有任务，并连接终端，就进入交互模式
 
 ```bash
-python3 06-cli/src/main.py
+python3 07-cli/src/main.py
 ```
 
 `sys.stdin.isatty()` 用来识别输入是否来自终端。自动判断之外，也可以用 `--interactive` 强制交互模式；测试可以通过管道提供 `/help`、`/quit` 等输入。
 
 ```bash
-python3 06-cli/src/main.py --demo --interactive --plain
+python3 07-cli/src/main.py --demo --interactive --plain
 ```
 
 交互模式遇到一个任务错误后继续接受输入，不让一次网络失败结束整个会话。编辑输入时 Ctrl+C 取消输入；执行任务时 Ctrl+C 中断这一轮；Ctrl+D 或 `/quit` 退出。
@@ -125,7 +125,7 @@ Renderer 不解释模型文字中的 Rich markup。模型输出 `[red]` 时，�
 交互时，用户想知道模型正在做什么；管道中，下游程序通常只想得到任务结果。
 
 ```bash
-python3 06-cli/src/main.py --print "概括 README.md" > summary.txt
+python3 07-cli/src/main.py --print "概括 README.md" > summary.txt
 ```
 
 `summary.txt` 只包含最终回答。会话路径、扩展日志、工具名称、压缩提示和错误放在 stderr，不污染正文。
@@ -163,7 +163,7 @@ python3 06-cli/src/main.py --print "概括 README.md" > summary.txt
 | `-c` / `--continue` | 继续当前项目最近修改的 JSONL，没有时创建新会话 |
 | `--session path` | 打开指定文件；不存在时报错，不把拼错的路径创建成新会话 |
 
-`-c` 和 `--session` 互斥。第 4、5 章的会话可以通过 `--session` 明确打开；它们不在第 6 章默认的最近会话目录中。
+`-c` 和 `--session` 互斥。第 4、5 章的会话可以通过 `--session` 明确打开；它们不在第 7 章默认的最近会话目录中。
 
 恢复会话不会恢复文件系统。工具仍在当前工作目录运行，因此恢复其他项目的会话前，应切换到相应项目目录。模型切换由启动参数决定；这个版本不提供交互式 `/model`，也没有完整的跨模型历史修复。
 
@@ -226,16 +226,16 @@ code, exit_requested = run_turn(agent, text, ...)
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r 06-cli/requirements.txt
+pip install -r 07-cli/requirements.txt
 
 # 无需 API key
-python3 06-cli/src/main.py --demo "介绍这个项目"
+python3 07-cli/src/main.py --demo "介绍这个项目"
 
 # 交互模式，试试 /project、/tree、/tokens、/help
-python3 06-cli/src/main.py --demo --interactive
+python3 07-cli/src/main.py --demo --interactive
 
 # 显式查看流式过程
-python3 06-cli/src/main.py --demo --stream "介绍这个项目"
+python3 07-cli/src/main.py --demo --stream "介绍这个项目"
 ```
 
 离线 Provider 只演示固定流程，不理解任意任务。离线压缩返回示例文字，也不应拿来保存需要保真的真实工作会话。
@@ -247,28 +247,32 @@ export OPENAI_API_KEY="your-api-key"
 export OPENAI_MODEL="gpt-4o-mini"     # 可选，默认值相同
 # export OPENAI_BASE_URL="https://your-compatible-endpoint/v1"
 
-python3 06-cli/src/main.py "读取 README.md，说明每章实现了什么"
-python3 06-cli/src/main.py -c
-python3 06-cli/src/main.py --session /path/to/session.jsonl
+python3 07-cli/src/main.py "读取 README.md，说明每章实现了什么"
+python3 07-cli/src/main.py -c
+python3 07-cli/src/main.py --session /path/to/session.jsonl
 
 # Anthropic 模型名称由你提供
 export ANTHROPIC_API_KEY="your-api-key"
 export ANTHROPIC_MODEL="your-model-id"
-python3 06-cli/src/main.py --provider anthropic
+python3 07-cli/src/main.py --provider anthropic
 
 # 额外加载扩展
-python3 06-cli/src/main.py -e /path/to/extension.py
+python3 07-cli/src/main.py -e /path/to/extension.py
 
 # 不加载附带扩展；显式 -e 指定的文件仍会加载
-python3 06-cli/src/main.py --no-extensions -e /path/to/extension.py
+python3 07-cli/src/main.py --no-extensions -e /path/to/extension.py
+
+# Skill：默认自动扫描项目与用户的 .mini-pi/skills/（存在时），可追加目录
+python3 07-cli/src/main.py --skills-dir ./docs-skills "按检查单处理"
+python3 07-cli/src/main.py --no-skills   # 全部关闭
 ```
 
-默认附带扩展包括项目查看、工具日志和 bash 字符串拦截示例。关闭示例扩展不会关闭四个内置工具，也不会改变系统权限。
+默认附带扩展包括项目查看、工具日志和 bash 字符串拦截示例。关闭示例扩展不会关闭四个内置工具，也不会改变系统权限。Skill 的机制与示例见[第 6 章](../06-skills/README.md)；加载后可用 `/skill <名字> [请求]` 强制加载某个 Skill。
 
 缩小窗口时同时设置压缩预算：
 
 ```bash
-python3 06-cli/src/main.py --context-window 20000 --reserve-tokens 8000 --keep-recent-tokens 4000
+python3 07-cli/src/main.py --context-window 20000 --reserve-tokens 8000 --keep-recent-tokens 4000
 ```
 
 `context-window` 是用户提供的预算，本章不自动查询模型规格。它必须与预留、保留预算一起调整。估算未包含完整协议和工具定义开销，压缩摘要本身也可能超限。
@@ -278,7 +282,7 @@ python3 06-cli/src/main.py --context-window 20000 --reserve-tokens 8000 --keep-r
 激活虚拟环境后，把启动器目录加入 PATH：
 
 ```bash
-export PATH="$PWD/06-cli:$PATH"
+export PATH="$PWD/07-cli:$PATH"
 mini-pi --demo "介绍当前目录"
 ```
 
@@ -289,7 +293,7 @@ mini-pi --demo "介绍当前目录"
 连接真实模型后，可以尝试：
 
 ```bash
-python3 06-cli/src/main.py "在 /tmp/mini-pi-playground/hello.py 创建一个打印 Hello mini-pi 的程序，用 bash 运行它，再用 read 确认内容"
+python3 07-cli/src/main.py "在 /tmp/mini-pi-playground/hello.py 创建一个打印 Hello mini-pi 的程序，用 bash 运行它，再用 read 确认内容"
 ```
 
 这条任务串起 write、bash、read、Provider 和会话存储。退出后用 `-c` 恢复，输入 `/tree` 查看调用历史。再输入 `/compact 保留文件路径和运行结果`，观察模型生成摘要并保留近期消息。
@@ -324,7 +328,7 @@ pi 参考提交的 [`setupKeyHandlers()`](https://github.com/earendil-works/pi/b
 |---|---|---|---|---|
 | 本教程关注点 | 可读的 Python 最小实现 | 可扩展的 Agent harness | 围绕模型的工具、上下文与使用流程 | 可组合的 Agent、工具与运行环境 |
 | 模型边界 | OpenAI / Anthropic Provider | 独立 AI 包与 Provider 能力 | Claude 模型与 Agent 工具循环 | LLM 与 Agent 核心分层 |
-| 扩展边界 | Python 注册工具、命令和钩子 | 扩展、skills、模板、主题和包 | hooks、skills、MCP、subagents | SDK 与工具、workspace、agent server 分层 |
+| 扩展边界 | Python 注册工具、命令、钩子与 Skill 加载 | 扩展、skills、模板、主题和包 | hooks、skills、MCP、subagents | SDK 与工具、workspace、agent server 分层 |
 | 执行环境 | 当前本机进程，无沙箱 | 通过运行时和扩展组织执行能力 | 本地、云端或远程控制等入口 | 本地或远端 workspace，支持沙箱运行 |
 | 本章 UI | 行式 CLI | 交互终端、print 等模式 | 终端及其他界面 | SDK 可嵌入不同应用 |
 
@@ -368,7 +372,7 @@ mini-pi 也暂时不实现子 Agent，但理由首先是教学范围：子 Agent
 ## 测试（无需 API key）
 
 ```bash
-python3 -m pytest 06-cli/src/test_cli.py -v
+python3 -m pytest 07-cli/src/test_cli.py -v
 
 # 所有章节在各自的进程中运行
 python3 scripts/test.py
@@ -394,6 +398,6 @@ API 调用仍由假 Provider 或假 SDK 对象模拟。这些测试保证本地�
 
 ## 继续阅读
 
-接着阅读[第 7 章：Harness——设计思路、取舍与验证](../07-harness/README.md)，讨论这些实现背后的选择，以及如何判断生成代码与新增机制是否可靠。
+接着阅读[第 8 章：Harness——设计思路、取舍与验证](../08-harness/README.md)，讨论这些实现背后的选择，以及如何判断生成代码与新增机制是否可靠。
 
 先选一个当前实现的边界，回到 pi 固定提交的对应文件阅读，再自己补一项需求。主循环已经足够小；剩下的工程工作，是让它在异常、长任务、多种模型和真实用户输入下保持可解释、可恢复的行为。

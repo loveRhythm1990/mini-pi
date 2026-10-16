@@ -111,11 +111,12 @@ python3 05-extensions/src/main.py -e ./my_ext.py
 [扩展日志] 即将调用 project_info           ← log_calls 的输出（stderr）
 工作目录：/Users/you/mini-pi
 05-extensions/
-06-cli/
+06-skills/
+07-cli/
 ...
 README.md
 [扩展日志] project_info 返回 512 字符
-这个项目是一个中文教程，包含七个章节……      ← 模型基于工具结果给出回答
+这个项目是一个中文教程，包含八个章节……      ← 模型基于工具结果给出回答
 ```
 
 三个要点：
@@ -625,4 +626,4 @@ python3 -m pytest 05-extensions/src/test_extensions.py -v
 
 ## 下一步
 
-现在核心循环允许扩展行为，前四章的能力也已接回同一个 Agent。第 6 章将复用这些模块，把命令行参数、流式输出、会话恢复、输入历史和中断处理组织成完整的使用体验。
+现在核心循环允许扩展行为，前四章的能力也已接回同一个 Agent。第 6 章将实现 Skill 系统——与扩展并列的另一条定制通道：扩展添加常驻注册的行为，Skill 按需装载指令。第 7 章再把这些模块组织成完整的 CLI 体验。

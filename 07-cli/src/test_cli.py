@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from ui import Renderer
 
 ROOT = Path(__file__).resolve().parents[2]
-ENTRY = ROOT / "06-cli" / "src" / "main.py"
+ENTRY = ROOT / "07-cli" / "src" / "main.py"
 
 
 def run_cli(tmp_path, *args, text=None):
