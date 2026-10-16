@@ -465,6 +465,75 @@ pi 的 [扩展文档：工具暴露与激活](https://github.com/earendil-works/
 
 本章注册后直接把所有定义发给模型。它适合少量工具的教程；真实系统中工具越来越多时，应该考虑激活集合、延迟发现和 Schema 带来的上下文开销。
 
+### 5. 端到端：官方示例的真实长相
+
+前面的对照都停在 API 层面。换一个视角：把官方示例库（[examples/extensions/](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions)，80 个可运行的扩展）里最贴近本章三个附带示例的几个真实文件搬出来，从“用户放文件”到“看到效果”完整走一遍。
+
+**最小工具：[`hello.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/hello.ts)**（对照 `project_info` 的工具部分）
+
+```typescript
+// 放进 ~/.pi/agent/extensions/ 即生效，无需编译
+import { Type } from "@earendil-works/pi-ai";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+const helloTool = defineTool({
+	name: "hello",
+	label: "Hello",
+	description: "A simple greeting tool",
+	parameters: Type.Object({
+		name: Type.String({ description: "Name to greet" }),
+	}),
+
+	async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		return {
+			content: [{ type: "text", text: `Hello, ${params.name}!` }],
+			details: { greeted: params.name },
+		};
+	},
+});
+
+export default function (pi: ExtensionAPI) {
+	pi.registerTool(helloTool);
+}
+```
+
+体验：对 pi 说“用 hello 工具向 world 问好”，模型调用 `hello`，屏幕出现 `Hello, world!`。与 mini-pi 的 `api.register_tool(定义, 执行器)` 一一对应：`defineTool` 的参数就是定义（名称/描述/TypeBox schema），`execute` 就是执行器。区别在结果更丰富：`content` 给模型，`details` 留给渲染与状态重建。
+
+**生产级拦截：[`protected-paths.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/protected-paths.ts)**（对照 `guard_bash`）
+
+```typescript
+// 节选，全文仅 30 余行
+export default function (pi: ExtensionAPI) {
+	const protectedPaths = [".env", ".git/", "node_modules/"];
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName !== "write" && event.toolName !== "edit") {
+			return undefined;
+		}
+
+		const path = event.input.path as string;
+		const isProtected = protectedPaths.some((p) => path.includes(p));
+
+		if (isProtected) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Blocked write to protected path: ${path}`, "warning");
+			}
+			return { block: true, reason: `Path "${path}" is protected` };
+		}
+
+		return undefined;
+	});
+}
+```
+
+与 `guard_bash` 的字符串匹配同一个思路，三处升级：事件名是 `tool_call`（对应我们的 `before_tool_call`）；拦截时**还在 UI 上发一条警告**（`ctx.ui.notify`）；返回 `{ block, reason }` 对应 `ToolDecision(block=True, reason=...)`。被 block 的调用同样会收到错误结果，配对协议与第三部分一致。同一目录的 [`confirm-destructive.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/confirm-destructive.ts) 演示了取消型决定：拦截“清空/切换会话”这类操作时用 `ctx.ui.confirm` 弹确认框，用户拒绝就 `return { cancel: true }`——决策类型从“拦工具”扩展到了“拦会话操作”。
+
+**分支正确的状态：[`todo.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/todo.ts) 的设计**
+
+todo.ts 注册一个 `todo` 工具和 `/todos` 命令，最有教学价值的是它的状态存放位置：不写文件、不存全局变量，而是放在**工具结果的 `details` 字段**里。于是状态自动跟随会话树——`/branch` 回到历史某点时，todo 列表就是那个时点的列表，不需要任何额外代码。这是第 4 章“分支”概念与扩展状态的天然衔接：**跟随分支的状态就应该住在分支上**（entry），而不是活在进程或磁盘的别处。
+
+三个示例的共同点值得强调：**没有任何一个要求碰 pi 的源码**。写文件、放目录、聊天——与 mini-pi 的 `-e` 是同一条流水线，只是 pi 的目录发现、TypeBox 类型、结果结构和 UI 能力都更完整。
+
 | 特性 | mini-pi 本章 | pi 参考提交 |
 |---|---|---|
 | 扩展语言 | Python | TypeScript / JavaScript |
