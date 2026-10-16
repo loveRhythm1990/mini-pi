@@ -6,63 +6,18 @@
 
 例如，我们想记录工具调用、禁止某类命令、增加一个查看项目的工具，或者在压缩前保存快照。把这些需求不断塞进 `prompt()`，主循环很快就变成业务逻辑的集合。
 
-本章把“什么时候允许改变行为”变成明确的接口：
+本章把"什么时候允许改变行为"变成明确的接口。扩展（extension）是一个普通文件，里面声明"注册什么"；宿主（Agent 程序）在固定的时机加载它、分发事件、执行注册的能力：
 
 | 能力 | 解决的问题 | 本章实现 |
 |---|---|---|
 | 工具注册 | 模型怎样知道并调用新能力？ | `ToolRegistry` |
-| 事件钩子 | 执行前后怎样插入逻辑？ | `ExtensionAPI.on()` |
 | 用户命令 | 怎样增加 `/project`，而不调用模型？ | `CommandRegistry` |
+| 事件钩子 | 执行前后怎样插入逻辑？ | `ExtensionAPI.on()` |
 | 扩展加载 | 怎样把这些行为放进单独文件？ | Python 文件中的 `setup(api)` |
 
-本章使用同步 Python，把工具串行执行；不引入异步调度、热重载和扩展包管理——用户如何安装配置、消息如何排队，在第六、七部分对照 pi 展开。pi 的源码对照固定在提交 [`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b)，不要把本章简化的事件名当成 pi 的实际 API。
+**阅读路线**：第一部分从使用开始——安装、体验，以及 pi 的真实安装版图；第二、三部分实现两个入口（工具给模型、命令给用户）；第四部分讲钩子，第五部分处理钩子带来的协议问题（拦截、截断、中断）；第六部分看宿主如何组装这一切；第七部分把运行时提炼为生产者-消费者模型，对照 pi 的消息队列；最后是与 pi 实现的逐项对照、运行方式与练习。
 
-## 先把前四章接起来
-
-第 4 章为了独立演示，直接使用 OpenAI 消息格式和 bash，没有接入第 2 章的 Provider、第 3 章的文件工具。本章先解决这个衔接问题。
-
-```
-第 2 章 Message / Provider ──── 模型调用
-                                  │
-第 3 章 read/write/edit/bash ── Agent ── 第 5 章扩展
-                                  │
-第 4 章 Session / Compaction ── 会话存储与摘要
-```
-
-我们复用已有实现，不再复制一份文件工具和压缩算法：
-
-- `previous.py` 把已有章节作为不同的 Python 包加载。
-- 第 2 章的 `Message`、`ToolCall`、`Provider` 移到 `messages.py`；原来的入口和 `from main import Message` 仍然可用。
-- `providers.py` 负责统一消息与会话记录之间的转换。
-- `SummaryClient` 把摘要请求送给当前 Provider，复用第 4 章的切点、提示词和上下文投影。
-
-为什么需要单独处理导入？各章都叫 `main.py`，直接把所有 `src/` 加进 `sys.path` 后再 `import main`，Python 可能拿到另一章已缓存的模块。`previous.py` 给每章一个独立包名，让这些模块有不同的身份。
-
-### 模型消息与存储记录是两个边界
-
-模型层使用第 2 章的结构：
-
-```python
-ToolCall(id="c1", name="read", arguments={"path": "README.md"})
-```
-
-第 4 章的 JSONL 文件仍使用可序列化的字典：
-
-```json
-{
-  "role": "assistant",
-  "content": "",
-  "tool_calls": [{
-    "id": "c1",
-    "type": "function",
-    "function": {"name": "read", "arguments": "{\"path\": \"README.md\"}"}
-  }]
-}
-```
-
-`to_record()` 在写入会话时转换，`to_message()` 在调用 Provider 前转换。这让存储格式保持兼容，而 Agent 不必根据厂商区分工具结果的角色和内容块。
-
-接入 Anthropic 时，还需要把 system 消息作为独立请求参数，并把同一批工具结果合并进一个后继 user 消息。接入摘要时，Provider 必须接收 `max_tokens`，而不能悄悄忽略第 4 章设置的摘要预算。对应修正在第 2 章适配器中，测试使用假的 SDK 响应。
+本章使用同步 Python，把工具串行执行；不引入异步调度、热重载和扩展包管理——用户如何安装配置在第一部分、消息如何排队在第七部分对照 pi 展开。pi 的源码对照固定在提交 [`8bb180bec133199c913ca8ef9bb30bd9ab12a72b`](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b)，不要把本章简化的事件名当成 pi 的实际 API。
 
 ## 文件结构
 
@@ -85,11 +40,13 @@ ToolCall(id="c1", name="read", arguments={"path": "README.md"})
 └── README.md
 ```
 
-这些文件依赖完整仓库中的第 2～4 章。每章有自己的运行入口；“独立运行”不代表只复制本章目录就能运行。
+这些文件依赖完整仓库中的第 2～4 章。每章有自己的运行入口；"独立运行"不代表只复制本章目录就能运行。
 
-## 第一部分：把工具变成注册表
+## 第一部分：从使用开始
 
-### 用户视角：安装与使用
+机制留到后面，先回答使用者的三个问题：怎么装、装完会怎样、pi 里是什么样。
+
+### 安装：把文件交给宿主
 
 注册写在扩展文件里，由宿主在加载时执行；使用者的动作只有一个——把文件交给宿主：
 
@@ -98,13 +55,15 @@ ToolCall(id="c1", name="read", arguments={"path": "README.md"})
 python3 05-extensions/src/main.py -e ./my_ext.py
 
 # pi：放进扩展目录后自动加载，或临时指定
-#   ~/.pi/agent/extensions/my_ext.ts（所有项目生效，详见第六部分）
+#   ~/.pi/agent/extensions/my_ext.ts（所有项目生效）
 #   pi --extension ./my_ext.ts
 ```
 
-扩展文件可以自己编写（下一小节），也可以使用别人写好的，宿主不做区分：加载时逐条执行文件里的 `api.register_tool(...)`，工具随之进入注册表。附带的三个示例扩展由入口自动加载，无需任何参数。
+扩展文件可以自己编写（第二部分就教），也可以使用别人写好的，宿主不做区分：加载时逐条执行文件里的 `api.register_tool(...)`，工具随之进入注册表。附带的三个示例扩展由入口自动加载，无需任何参数。
 
-安装之后，界面上没有任何变化：提示符相同，`/help` 也不多一行（那是命令，见第四部分）。变化发生在模型的工具箱里。一次典型的交互：
+### 装好之后：变化在工具箱，不在界面
+
+安装之后，界面上没有任何变化：提示符相同，`/help` 也不多一行（`/project` 除外——那是命令，见第三部分）。变化发生在模型的工具箱里。一次典型的交互：
 
 ```
 > 这个项目的目录里都有什么？
@@ -121,17 +80,35 @@ README.md
 
 三个要点：
 
-1. **工具由模型调用**。不存在“执行 project_info”这样的操作；使用者用自然语言描述任务，模型自行决定是否使用工具。希望模型更常用某个工具，依靠的是提示词和工具描述，而不是菜单
+1. **工具由模型调用**。不存在"执行 project_info"这样的操作；使用者用自然语言描述任务，模型自行决定是否使用工具。希望模型更常用某个工具，依靠的是提示词和工具描述，而不是菜单
 2. **验证安装的方法是派任务**。给模型一件需要该工具的事，观察它是否被调用；`log_calls` 输出到 stderr 的日志正好是观察窗口。本章没有列出工具清单的命令
-3. **工具定义占用上下文**。`definitions()` 的内容作为 `tools` 参数出现在每一次请求中，消耗 token。这是 pi 区分“注册”与“激活”的原因（对比部分第 4 节）：注册一百个、只激活十个，工具定义才不会吃掉预算
+3. **工具定义占用上下文**。`definitions()` 的内容作为 `tools` 参数出现在每一次请求中，消耗 token。这是 pi 区分"注册"与"激活"的原因（对比部分第 4 节）：注册一百个、只激活十个，工具定义才不会吃掉预算
 
-这也解释了为什么注册项必须**定义与执行器成对**（下一小节）：定义是给模型看的说明书，执行器是兑现说明书的函数——缺前者模型不知道有这个能力，缺后者模型调用时无人响应。
+### pi 的安装版图
 
-### 工具定义和执行器必须一起注册
+pi 的扩展从三个来源进入，用户不用改任何代码：
 
-只把新工具的 JSON Schema 发给模型是不够的；模型调用它后，程序还要找到真正的执行函数。
+| 来源 | 位置 | 适合 |
+|---|---|---|
+| 用户级 | `~/.pi/agent/extensions/` | 跟着人走，所有项目生效 |
+| 项目级 | 仓库里的 `.pi/extensions/` | 跟着仓库走，团队共享（提交进 Git） |
+| 命令行 | `pi --extension ./hello.ts` | 开发调试，一次性 |
 
-一个注册项包含两部分：
+发现规则（[`loader.ts` L782-787](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/extensions/loader.ts#L782-L787)）：目录下的直接 `.ts` / `.js` 文件、带 `index.ts` / `index.js` 的子目录、带 `package.json` 且声明了 `"pi"` 字段的子目录，都会被加载。
+
+开发循环很顺：写一个 TypeScript 文件，`pi --extension` 加载，不需要编译步骤（pi 用 `jiti` 直接执行 TS）；改完用 `/reload` 整体重载——重载会替换整个扩展运行时，`await ctx.reload()` 之后的代码不能复用旧运行时的状态。分发则通过 [Pi packages](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/docs/packages.md)。
+
+**项目扩展要过信任关**。扩展与宿主同进程、同权限（能读文件、网络和凭据），所以项目级扩展在首次打开时会触发信任确认（[`project-trust.ts` L47](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/project-trust.ts#L47) 的 `resolveProjectTrusted`）：用户可以选择记住决定；`defaultProjectTrust` 设置能把它固化成 `ask`（默认）/ `always` / `never`；个人级和命令行扩展甚至可以通过 `project_trust` 事件替用户自动作答。这层设计对应一个现实威胁：clone 一个陌生仓库时，`.pi/extensions/` 里的代码不能自动获得执行权。
+
+mini-pi 的安装没有这么多层次：`-e` 显式指定、附带示例自动加载，仅此而已。差距是刻意的——教学实现里，所有加载行为都发生在明处。
+
+## 第二部分：把工具变成注册表
+
+使用体验背后，第一个要回答的机制问题是：一个新工具如何进入模型的工具箱，并且在被调用时找到真正的执行函数？
+
+### 定义与执行器必须成对
+
+只把新工具的 JSON Schema 发给模型是不够的；模型调用它后，程序还要找到真正的执行函数。一个注册项因此包含两部分——**定义是给模型看的说明书，执行器是兑现说明书的函数**：
 
 ```python
 api.register_tool(
@@ -149,27 +126,17 @@ api.register_tool(
 )
 ```
 
-`definitions()` 返回工具定义的副本。Agent 在每次调用模型时读取它，因此扩展注册的新工具会出现在下一次请求中。
+`definitions()` 返回工具定义的副本。Agent 在每次调用模型时读取它，因此扩展注册的新工具会出现在下一次请求中。`execute(name, arguments)` 根据名称查找执行器。工具名称重复时直接报错，避免两个扩展无意间覆盖彼此，或把内置 `write` 替换成含义不同的工具。
 
-`execute(name, arguments)` 根据名称查找执行器。工具名称重复时直接报错，避免两个扩展无意间覆盖彼此，或把内置 `write` 替换成含义不同的工具。
+### 注册时检查定义，执行时检查参数
 
-### 注册时和执行时检查不同的事情
+两道检查在不同时间点发生。注册时检查名称、Schema 是否合法、执行器是否可调用；执行时用 `jsonschema` 验证模型实际生成的参数——例如模型发送 `{"text": 123}`，因为 `text` 应该是字符串，执行器不会被调用，模型得到一条"参数验证失败"的工具结果，可以在下一轮纠正。
 
-注册时检查名称、Schema 是否合法、执行器是否可调用。执行时用 `jsonschema` 验证模型实际生成的参数。
-
-例如，模型发送下面的参数：
-
-```json
-{"text": 123}
-```
-
-因为 `text` 应该是字符串，执行器不会被调用；模型得到一条“参数验证失败”的工具结果，可以在下一轮纠正。
-
-未知工具、参数错误和执行异常都转成字符串结果，不会因为一个工具失败就丢失整批消息。用户中断的 `KeyboardInterrupt` 则向上传递，让 Agent 和 CLI 完成清理。
+未知工具、参数错误和执行异常都转成字符串结果，不会因为一个工具失败就丢失整批消息。用户中断的 `KeyboardInterrupt` 则向上传递，让 Agent 和 CLI 完成清理（第五部分展开）。
 
 本教程统一要求工具返回字符串。图片、多种内容块、结构化结果和独立的 `is_error` 字段属于后续可以扩展的类型设计。
 
-### 内置工具也走同一条路径
+### 内置工具走同一条路径
 
 `builtin_tools()` 把第 3 章的四个工具注册进来。之后 Agent 不再包含：
 
@@ -180,11 +147,35 @@ elif name == "read":
     ...
 ```
 
-它只调用注册表。`read` 和扩展注册的 `project_info` 因此拥有相同的验证、钩子和历史记录路径。
+它只调用注册表。`read` 和扩展注册的 `project_info` 因此拥有相同的验证、钩子和历史记录路径——扩展拿到的不是"外挂待遇"，而是与内置能力完全一致的基础设施。
 
-## 第二部分：生命周期钩子
+## 第三部分：命令属于用户，工具属于模型
 
-### 钩子放在哪里？
+工具体现的是"模型的能力"；另一类入口服务于用户自己。`project_info` 工具被放在请求中，由模型选择何时调用；`/project` 命令由用户明确输入，程序立即执行，不发送给模型：
+
+```python
+from registry import CommandResult
+
+api.register_command(
+    "project",
+    "查看项目目录，不调用模型",
+    lambda args, agent: CommandResult("这里返回项目说明"),
+)
+```
+
+处理器收到斜杠命令后面的原始字符串。本章只做一次空格分割，不解析引号、子命令和多个选项；命令需要复杂参数时，可以自行用 `shlex.split()` 或 `argparse`。
+
+`CommandResult` 包含内容、是否退出、是否为错误。内置 `/help`、`/quit`、`/tree`、`/tokens`、`/compact`、`/branch` 也在同一个注册表中——内置命令和扩展命令没有区别。
+
+命令输入不会作为 user 消息进入模型历史。未知命令会直接提示 `/help`，不会把拼写错误交给模型猜测。`/compact` 是例外：命令本身不进入历史，但它需要调用模型生成摘要，并保存压缩检查点。
+
+`/branch` 会拒绝落在未完成工具批次中间的位置，避免切出一个缺少工具结果的上下文（原因见第五部分）。它仍只改变当前对话分支，不恢复磁盘文件，也不恢复 Git 分支。
+
+## 第四部分：生命周期钩子
+
+工具和命令解决"能力从哪来"；钩子解决"什么时候插入逻辑"。记录每次调用、拦截危险命令、在压缩前保存快照——这些需求都不新增能力，只要求在主循环的固定节拍上挂一段代码。
+
+### 钩子在主循环的哪里
 
 ```
 保存 user 消息
@@ -235,19 +226,15 @@ api.on("before_tool_call", before)
 
 每个处理器收到事件数据的深拷贝。修改 `event["arguments"]` 不会偷偷改变实际调用，只有显式返回决定才生效。事件数据的隔离有助于理解行为，但扩展仍拿得到 Agent 对象，不能把它当成权限隔离。
 
-### 多个扩展怎么组合？
+### 多个扩展的组合
 
-按注册顺序执行。前置钩子返回 block 后立即结束，本次工具不执行；后面的前置钩子也不执行。
-
-后置钩子按顺序改写结果。例如 A 在结果后加 `-a`，B 再加 `-b`，结果成为 `原结果-a-b`。B 看见的是 A 修改后的字符串，而不是最初的结果。
+按注册顺序执行。前置钩子返回 block 后立即结束，本次工具不执行；后面的前置钩子也不执行。后置钩子按顺序改写结果：例如 A 在结果后加 `-a`，B 再加 `-b`，结果成为 `原结果-a-b`——B 看见的是 A 修改后的字符串，而不是最初的结果。
 
 宿主在开始分发时固定处理器列表。处理器运行中注册的新钩子，到下一次同类事件才生效，不会把当前分发变成一个无限增长的循环。
 
-### 扩展异常不能一律“忽略后继续”
+### 扩展异常不能一律"忽略后继续"
 
-观察事件出错时，报告错误后继续。日志扩展失败，不应该把已经成功执行的文件读取变成失败。
-
-前置决策钩子出错时，阻止当前操作。假设检查规则加载失败，直接继续执行命令会绕过本来应该进行的检查。
+观察事件出错时，报告错误后继续——日志扩展失败，不应该把已经成功执行的文件读取变成失败。前置决策钩子出错时则阻止当前操作：检查规则加载失败还继续执行命令，等于绕过了本该进行的检查。
 
 | 出错位置 | 本章处理 |
 |---|---|
@@ -259,11 +246,13 @@ api.on("before_tool_call", before)
 
 取消自动压缩不会让上下文凭空变小。若模型随后报告上下文超限，恢复压缩也被取消，本轮会返回错误，而不会无限重试。
 
-## 第三部分：被拦截，也要保存结果
+## 第五部分：拦截、截断与中断下的协议完整性
 
-这是扩展机制最容易遗漏的地方。
+钩子让扩展可以拦下调用，但拦截本身会制造协议问题。这一部分处理三种"半途而废"的情况，它们的答案共同指向第 4 章建立的规则：**每个 toolCall 必须有配对的 toolResult**。
 
-模型已经返回了 `tool_call_id="c1"`。即使扩展阻止执行，历史里也必须有对应的工具结果：
+### 被拦截，也要保存结果
+
+这是扩展机制最容易遗漏的地方。模型已经返回了 `tool_call_id="c1"`，即使扩展阻止执行，历史里也必须有对应的工具结果：
 
 ```json
 {
@@ -273,43 +262,25 @@ api.on("before_tool_call", before)
 }
 ```
 
-拦截是“用错误结果替代执行”，不能直接 `continue` 跳过消息。否则下一次请求可能因为工具调用与结果不配对而被 API 拒绝。
+拦截是"用错误结果替代执行"，不能直接 `continue` 跳过消息。否则下一次请求可能因为工具调用与结果不配对而被 API 拒绝。
 
-模型输出因 token 上限被截断时，也不能执行可能不完整的工具调用。适配器保留 `stop_reason`，Agent 在 `length` 或 `max_tokens` 时补充“工具未执行”的结果，再结束本轮并报告错误。
+### 截断的输出不能执行
 
-### 中断后为什么不自动重试工具？
+模型输出因 token 上限被截断时，也不能执行可能不完整的工具调用。适配器保留 `stop_reason`，Agent 在 `length` 或 `max_tokens` 时补充"工具未执行"的结果，再结束本轮并报告错误——截断的参数可能解析成功但悄悄缺失内容，执行它比报错危险得多。
 
-假设 `write` 已写完文件，但进程在保存结果之前退出。仅凭 JSONL 文件中的未完成调用，无法知道工具是“完全没执行”还是“已经产生副作用”。自动重放可能覆盖文件、重复提交或重复发送请求。
+### 中断后为什么不自动重试工具
 
-本章采用保守且可解释的恢复方式：找到末尾未配对的调用，追加合成错误结果，提示用户先检查实际状态，不执行这些工具。
+假设 `write` 已写完文件，但进程在保存结果之前退出。仅凭 JSONL 文件中的未完成调用，无法知道工具是"完全没执行"还是"已经产生副作用"。自动重放可能覆盖文件、重复提交或重复发送请求。
 
-如果一批工具有两个调用，第一个执行时被中断，第二个尚未开始，两个 id 都会补齐结果。CLI 可以继续接收新请求，下一次模型请求拥有完整的消息协议。
+本章采用保守且可解释的恢复方式：找到末尾未配对的调用，追加合成错误结果，提示用户先检查实际状态，不执行这些工具。如果一批工具有两个调用，第一个执行时被中断，第二个尚未开始，两个 id 都会补齐结果——CLI 可以继续接收新请求，下一次模型请求拥有完整的消息协议。
 
 这不实现文件回滚，也不能保证写文件的原子性；这里恢复的是**对话结构**。JSONL 中间已有损坏的调用顺序时，程序报错，不猜测应该怎样重排历史。
 
-## 第四部分：命令属于用户，工具属于模型
+## 第六部分：宿主的组装
 
-`project_info` 工具被放在请求中，由模型选择何时调用。`/project` 命令由用户明确输入，程序立即执行，不发送给模型。
+机制都有了：注册表、钩子、两条入口。最后看宿主怎么把它们装配起来——包括加载扩展文件，以及把前四章的实现接进同一个循环。
 
-```python
-from registry import CommandResult
-
-api.register_command(
-    "project",
-    "查看项目目录，不调用模型",
-    lambda args, agent: CommandResult("这里返回项目说明"),
-)
-```
-
-处理器收到斜杠命令后面的原始字符串。本章只做一次空格分割，不解析引号、子命令和多个选项；命令需要复杂参数时，可以自行用 `shlex.split()` 或 `argparse`。
-
-`CommandResult` 包含内容、是否退出、是否为错误。内置 `/help`、`/quit`、`/tree`、`/tokens`、`/compact`、`/branch` 也在同一个注册表中。
-
-命令输入不会作为 user 消息进入模型历史。未知命令会直接提示 `/help`，不会把拼写错误交给模型猜测。`/compact` 是例外：命令本身不进入历史，但它需要调用模型生成摘要，并保存压缩检查点。
-
-`/branch` 会拒绝落在未完成工具批次中间的位置，避免切出一个缺少工具结果的上下文。它仍只改变当前对话分支，不恢复磁盘文件，也不恢复 Git 分支。
-
-## 第五部分：加载扩展文件
+### 加载扩展文件
 
 扩展是一个普通 Python 文件，导出 `setup(api)`：
 
@@ -320,55 +291,37 @@ def setup(api):
     api.register_command("hello", "打招呼", handler)
 ```
 
-宿主用 `importlib` 加载文件，然后调用 `setup()`。加载阶段通常只注册行为；真正的文件读取和命令执行应放在工具或命令处理器中。
+宿主用 `importlib` 加载文件，然后调用 `setup()`。加载阶段通常只注册行为；真正的文件读取和命令执行应放在工具或命令处理器中。示例入口固定先加载三个附带扩展，再依次加载 `-e` 给出的路径——**加载顺序即钩子顺序**（第四部分的组合规则）。
 
-示例入口默认加载三个附带扩展，也可以用 `-e path/to/extension.py` 加载自己的文件。不扫描当前项目中的任意 Python 文件，不实现重载、依赖安装或扩展卸载。
+未实现的部分同样明确：不扫描目录、不支持重载、不能运行中启停（练习 2 补上）、没有包管理。扩展文件必须显式指定。
 
 Python 扩展与宿主运行在同一进程，拥有相同的文件和网络权限。附带的 `guard_bash.py` 只是展示钩子：`rm` 的别名、脚本、参数变形和其他删除方式都可能绕过字符串匹配，它不是沙箱，也不是完整的权限策略。
 
-## 第六部分：用户视角——安装、发现与配置
+### 与前四章的接线
 
-写作视角之外，安装视角同样重要：文件放在哪里、宿主如何发现它、如何保证安全。两个实现给出了复杂度不同的答案。
+第 4 章为了独立演示，直接使用 OpenAI 消息格式和 bash，没有接入第 2 章的 Provider、第 3 章的文件工具。本章把它们接回同一个 Agent：
 
-### mini-pi：一个开关，三个附带示例
-
-演示入口固定先加载 `examples/` 里的三个文件，再依次加载 `-e` 给出的路径：
-
-```bash
-python3 05-extensions/src/main.py -e ./my_ext.py -e ./another.py
+```
+第 2 章 Message / Provider ──── 模型调用
+                                  │
+第 3 章 read/write/edit/bash ── Agent ── 第 5 章扩展
+                                  │
+第 4 章 Session / Compaction ── 会话存储与摘要
 ```
 
-| 附带扩展 | 演示什么 | 怎么体验 |
-|---|---|---|
-| `project_info.py` | 同时注册一个模型工具和一个 `/project` 命令 | 交互模式输入 `/project`（不调模型）；或让模型自己调 `project_info` 工具 |
-| `log_calls.py` | 观察型钩子：`before_tool_call` / `after_tool_call` 记日志 | 正常使用工具；日志走 stderr（`api.report`），不混入模型输入输出 |
-| `guard_bash.py` | 决策型钩子：拦截包含 `rm ` 的 bash 调用 | 需要真实模型：让它“执行 rm -rf /tmp/test”，模型会收到拦截错误并改道 |
+实现上有两个细节值得知道。
 
-加载顺序即钩子顺序：`-e` 的扩展注册在附带示例之后，它们的钩子也排在后面（第二部分的多扩展组合规则）。
+**跨章导入**：各章的源文件都叫 `main.py`，直接把所有 `src/` 加进 `sys.path` 再 `import main`，Python 可能拿到另一章已缓存的模块。`previous.py` 给每章一个独立包名，让这些模块有不同的身份。
 
-未实现的部分同样明确：不扫描目录、不支持重载、不能运行中启停（练习 2 补上）、没有包管理。扩展文件必须显式指定，所有加载行为都发生在明处。
-
-### pi：三个来源、免编译加载、信任确认
-
-pi 的扩展从三个来源进入，用户不用改任何代码：
-
-| 来源 | 位置 | 适合 |
-|---|---|---|
-| 用户级 | `~/.pi/agent/extensions/` | 跟着人走，所有项目生效 |
-| 项目级 | 仓库里的 `.pi/extensions/` | 跟着仓库走，团队共享（提交进 Git） |
-| 命令行 | `pi --extension ./hello.ts` | 开发调试，一次性 |
-
-发现规则（[`loader.ts` L782-787](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/extensions/loader.ts#L782-L787)）：目录下的直接 `.ts` / `.js` 文件、带 `index.ts` / `index.js` 的子目录、带 `package.json` 且声明了 `"pi"` 字段的子目录，都会被加载。
-
-开发循环很顺：写一个 TypeScript 文件，`pi --extension` 加载，不需要编译步骤（pi 用 `jiti` 直接执行 TS）；改完用 `/reload` 整体重载——重载会替换整个扩展运行时，`await ctx.reload()` 之后的代码不能复用旧运行时的状态。分发则通过 [Pi packages](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/docs/packages.md)。
-
-**项目扩展要过信任关**。扩展与宿主同进程、同权限（能读文件、网络和凭据），所以项目级扩展在首次打开时会触发信任确认（[`project-trust.ts` L47](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/project-trust.ts#L47) 的 `resolveProjectTrusted`）：用户可以选择记住决定；`defaultProjectTrust` 设置能把它固化成 `ask`（默认）/ `always` / `never`；个人级和命令行扩展甚至可以通过 `project_trust` 事件替用户自动作答。这层设计对应一个现实威胁：clone 一个陌生仓库时，`.pi/extensions/` 里的代码不能自动获得执行权。
+**两个消息边界**：模型层使用第 2 章的结构（`ToolCall(id="c1", name="read", arguments={...})`），第 4 章的 JSONL 文件使用可序列化的字典（`"function": {"name": ..., "arguments": "{\"path\": ...}"}`）。`to_record()` 在写入会话时转换，`to_message()` 在调用 Provider 前转换——存储格式保持兼容，Agent 不必根据厂商区分工具结果的角色和内容块。接入 Anthropic 时还需要把 system 消息作为独立请求参数、把同一批工具结果合并进一个后继 user 消息；接入摘要时，Provider 必须接收 `max_tokens` 而不能悄悄忽略第 4 章的摘要预算。对应修正在第 2 章适配器中，测试使用假的 SDK 响应。
 
 ## 第七部分：生产者与消费者
 
+最后退一步，看运行时的整体图景。这一部分给钩子机制一个更准确的名字，也解释 mini-pi 与 pi 在"忙碌时能不能输入"上的差距从何而来。
+
 ### 事件分发的本质：宿主生产，扩展消费
 
-现在可以给这套钩子机制一个更准确的名字：**宿主是事件的生产者，扩展是消费者**。生产发生在固定时机、携带固定数据（第二部分那张流程图就是“生产线”）；消费按注册顺序进行。与直接函数调用相比，方向反了过来——宿主不知道谁在听，新增行为不需要改主循环。这就是控制反转：不是“主循环调用扩展的逻辑”，而是“扩展的逻辑订阅主循环的节拍”。
+**宿主是事件的生产者，扩展是消费者**。生产发生在固定时机、携带固定数据（第四部分那张流程图就是"生产线"）；消费按注册顺序进行。与直接函数调用相比，方向反了过来——宿主不知道谁在听，新增行为不需要改主循环。这就是控制反转：不是"主循环调用扩展的逻辑"，而是"扩展的逻辑订阅主循环的节拍"。
 
 消费者有两种姿态：
 
@@ -377,7 +330,7 @@ pi 的扩展从三个来源进入，用户不用改任何代码：
 | 观察（notify） | `turn_start`、`turn_end`、`after_compact`、`after_tool_call` | 分发完就继续，返回值只用于结果改写 |
 | 审批（request-response） | `before_tool_call`、`before_compact` | 宿主停下来等决定：执行、拦截、替换参数、取消 |
 
-mini-pi 的分发是**同步背靠背**的：生产一条、消费一条，消费者的耗时直接加在主循环上。pi 也一样——处理器是 `await` 的，官方文档明确提醒“慢处理器会拖慢流式消费”。
+mini-pi 的分发是**同步背靠背**的：生产一条、消费一条，消费者的耗时直接加在主循环上。pi 也一样——处理器是 `await` 的，官方文档明确提醒"慢处理器会拖慢流式消费"。
 
 ### mini-pi 的边界：串行世界
 
@@ -391,7 +344,7 @@ while True:
 
 `input()` 和 `prompt()` 互相等待——模型工作时用户**无法生产输入**，唯一的例外是 Ctrl+C，而它走的不是队列，是第 4 章的 abort 路径。这种实现简单直接，但体验有代价：长任务执行期间，中途想到的修正只能等待。
 
-### pi 的两个队列：steering 与 follow-up
+### pi 的双队列：steering 与 follow-up
 
 pi 在用户（生产者）和 agent 循环（消费者）之间放了两条队列：[`agent.ts` L143-170](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/agent/src/agent.ts#L143-L170) 的 `PendingMessageQueue`（消息数组 + 模式 + `enqueue` / `peek` / `drain`），实例化为 `steeringQueue` 和 `followUpQueue`，分别由 `steer()`（L299）和 `followUp()`（L304）投递：
 
@@ -431,8 +384,8 @@ assistant ─┘
 
 两个设计值得停下来想：
 
-1. **为什么在“回合边界”消费，而不是立刻？** 模型的回复是流式的，工具调用与结果必须配对（第 4 章）——把用户消息插进 assistant 消息和它的工具结果中间会破坏协议，插进一条流式回复的中间则谁都读不懂。回合边界是“语义完整”的最小单位；队列把“随时生产”翻译成了“在安全点消费”。
-2. **默认一次只喂一条。** 队列模式 `one-at-a-time`（默认，`settings.json` 的 `steeringMode` / `followUpMode`，可改 `all`）：每回合只送出队首那条。用户排队三条补充，模型每轮先消化第一条、给出反应，再收下一条——避免三条一起砸进去，模型只回应最后一条、前两条被淹没。
+1. **为什么在"回合边界"消费，而不是立刻？** 模型的回复是流式的，工具调用与结果必须配对（第 4 章）——把用户消息插进 assistant 消息和它的工具结果中间会破坏协议，插进一条流式回复的中间则谁都读不懂。回合边界是"语义完整"的最小单位；队列把"随时生产"翻译成了"在安全点消费"
+2. **默认一次只喂一条。** 队列模式 `one-at-a-time`（默认，`settings.json` 的 `steeringMode` / `followUpMode`，可改 `all`）：每回合只送出队首那条。用户排队三条补充，模型每轮先消化第一条、给出反应，再收下一条——避免三条一起砸进去，模型只回应最后一条、前两条被淹没
 
 abort 的处理也顺理成章：`Escape` 中止时，队列里没消费的消息全部退回编辑器（[interactive-mode.ts L3072](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L3072)）——没说出口的话，不该凭空消失。
 
@@ -452,7 +405,7 @@ pi 的 [`runner.ts`，L1242–1259](https://github.com/earendil-works/pi/blob/8b
 
 [`emitToolResult()`，L1183–1240](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/extensions/runner.ts#L1183-L1240) 让处理器依次修改当前结果。pi 的结果还能包含内容块、details、structuredContent、isError 和 usage；本章只处理一个字符串。
 
-`await handler(...)` 表示等待扩展完成；慢处理器会延长实际执行时间。`undefined` 可以理解成“没有返回改写决定”，相当于这里的 `None`。
+`await handler(...)` 表示等待扩展完成；慢处理器会延长实际执行时间。`undefined` 可以理解成"没有返回改写决定"，相当于这里的 `None`。
 
 ### 3. 压缩前的事件
 
@@ -468,7 +421,7 @@ pi 的 [扩展文档：工具暴露与激活](https://github.com/earendil-works/
 
 ### 5. 端到端：官方示例的真实长相
 
-前面的对照都停在 API 层面。换一个视角：把官方示例库（[examples/extensions/](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions)，80 个可运行的扩展）里最贴近本章三个附带示例的几个真实文件搬出来，从“用户放文件”到“看到效果”完整走一遍。
+前面的对照都停在 API 层面。换一个视角：把官方示例库（[examples/extensions/](https://github.com/earendil-works/pi/tree/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions)，80 个可运行的扩展）里最贴近本章三个附带示例的几个真实文件搬出来，从"用户放文件"到"看到效果"完整走一遍。
 
 **最小工具：[`hello.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/hello.ts)**（对照 `project_info` 的工具部分）
 
@@ -498,7 +451,7 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-体验：对 pi 说“用 hello 工具向 world 问好”，模型调用 `hello`，屏幕出现 `Hello, world!`。与 mini-pi 的 `api.register_tool(定义, 执行器)` 一一对应：`defineTool` 的参数就是定义（名称/描述/TypeBox schema），`execute` 就是执行器。区别在结果更丰富：`content` 给模型，`details` 留给渲染与状态重建。
+体验：对 pi 说"用 hello 工具向 world 问好"，模型调用 `hello`，屏幕出现 `Hello, world!`。与 mini-pi 的 `api.register_tool(定义, 执行器)` 一一对应：`defineTool` 的参数就是定义（名称/描述/TypeBox schema），`execute` 就是执行器。区别在结果更丰富：`content` 给模型，`details` 留给渲染与状态重建。
 
 **生产级拦截：[`protected-paths.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/protected-paths.ts)**（对照 `guard_bash`）
 
@@ -527,11 +480,11 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-与 `guard_bash` 的字符串匹配同一个思路，三处升级：事件名是 `tool_call`（对应我们的 `before_tool_call`）；拦截时**还在 UI 上发一条警告**（`ctx.ui.notify`）；返回 `{ block, reason }` 对应 `ToolDecision(block=True, reason=...)`。被 block 的调用同样会收到错误结果，配对协议与第三部分一致。同一目录的 [`confirm-destructive.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/confirm-destructive.ts) 演示了取消型决定：拦截“清空/切换会话”这类操作时用 `ctx.ui.confirm` 弹确认框，用户拒绝就 `return { cancel: true }`——决策类型从“拦工具”扩展到了“拦会话操作”。
+与 `guard_bash` 的字符串匹配同一个思路，三处升级：事件名是 `tool_call`（对应我们的 `before_tool_call`）；拦截时**还在 UI 上发一条警告**（`ctx.ui.notify`）；返回 `{ block, reason }` 对应 `ToolDecision(block=True, reason=...)`。被 block 的调用同样会收到错误结果，配对协议与第五部分一致。同一目录的 [`confirm-destructive.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/confirm-destructive.ts) 演示了取消型决定：拦截"清空/切换会话"这类操作时用 `ctx.ui.confirm` 弹确认框，用户拒绝就 `return { cancel: true }`——决策类型从"拦工具"扩展到了"拦会话操作"。
 
 **分支正确的状态：[`todo.ts`](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/examples/extensions/todo.ts) 的设计**
 
-todo.ts 注册一个 `todo` 工具和 `/todos` 命令，最有教学价值的是它的状态存放位置：不写文件、不存全局变量，而是放在**工具结果的 `details` 字段**里。于是状态自动跟随会话树——`/branch` 回到历史某点时，todo 列表就是那个时点的列表，不需要任何额外代码。这是第 4 章“分支”概念与扩展状态的天然衔接：**跟随分支的状态就应该住在分支上**（entry），而不是活在进程或磁盘的别处。
+todo.ts 注册一个 `todo` 工具和 `/todos` 命令，最有教学价值的是它的状态存放位置：不写文件、不存全局变量，而是放在**工具结果的 `details` 字段**里。于是状态自动跟随会话树——`/branch` 回到历史某点时，todo 列表就是那个时点的列表，不需要任何额外代码。这是第 4 章"分支"概念与扩展状态的天然衔接：**跟随分支的状态就应该住在分支上**（entry），而不是活在进程或磁盘的别处。
 
 三个示例的共同点值得强调：**没有任何一个要求碰 pi 的源码**。写文件、放目录、聊天——与 mini-pi 的 `-e` 是同一条流水线，只是 pi 的目录发现、TypeBox 类型、结果结构和 UI 能力都更完整。
 
@@ -569,15 +522,15 @@ python3 05-extensions/src/main.py --demo
 
 离线演示总是先调用项目查看工具，再输出结果，不会理解用户的任意任务，也不生成真实摘要。
 
-### 试用扩展（离线）
+### 试用三个附带扩展
 
-启动 `--demo` 交互模式后，可以逐个验证三个附带扩展：
+| 附带扩展 | 演示什么 | 怎么体验 |
+|---|---|---|
+| `project_info.py` | 同时注册一个模型工具和一个 `/project` 命令 | 交互模式输入 `/project`（不调模型，第三部分）；或让模型自己调 `project_info` 工具 |
+| `log_calls.py` | 观察型钩子：`before_tool_call` / `after_tool_call` 记日志 | 正常使用工具；日志走 stderr（`api.report`），不混入模型输入输出 |
+| `guard_bash.py` | 决策型钩子：拦截包含 `rm ` 的 bash 调用 | 需要真实模型：让它"执行 rm -rf /tmp/test"，模型会收到拦截错误并改道 |
 
-- 输入 `/project`：立即输出目录列表，全程不调模型——这是“命令属于用户”（第四部分）
-- 输入任意任务（如“介绍这个项目”）：假模型会先调 `project_info` 工具；其中 `[扩展日志]` 两行来自 `log_calls` 的 `before_tool_call` / `after_tool_call` 钩子（输出到 stderr）
-- 拦截演示需要真实模型：`python3 05-extensions/src/main.py "运行 rm -rf /tmp/mini-pi-demo"`——`guard_bash` 会拦下这条命令，模型收到错误结果后通常改道或解释原因
-
-连接模型：
+拦截演示需要真实模型：
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
@@ -592,7 +545,7 @@ python3 05-extensions/src/main.py --provider anthropic "读取 README.md"
 python3 05-extensions/src/main.py -e /path/to/hello.py
 ```
 
-本章演示入口会创建新会话，文件位于 `~/.mini-pi/chapter05/`。恢复、输入历史和流式终端展示在第 6 章统一实现。
+本章演示入口会创建新会话，文件位于 `~/.mini-pi/chapter05/`。恢复、输入历史和流式终端展示在第 7 章统一实现。
 
 ## 测试（无需 API key）
 
@@ -620,7 +573,7 @@ python3 -m pytest 05-extensions/src/test_extensions.py -v
 
 ### 练习 3：最简 steering 队列
 
-用 `threading` 和 `queue.Queue` 给本章入口加一条 steering 队列：主线程跑 `input()` 生产消息，Agent 在独立线程消费；消费点放在“下一次调用 Provider 之前”（`prompt()` 工具循环的每轮开头），与 pi 的回合边界一致。
+用 `threading` 和 `queue.Queue` 给本章入口加一条 steering 队列：主线程跑 `input()` 生产消息，Agent 在独立线程消费；消费点放在"下一次调用 Provider 之前"（`prompt()` 工具循环的每轮开头），与 pi 的回合边界一致。
 
 验证：任务执行中输入补充说明，模型在下一个回合看到它；Ctrl+C 中止时，队列里未消费的消息退回提示。注意两点：`ExtensionAPI.results` 的事件分发不是线程安全的，跨线程调用需要加锁或改回主线程执行；消费点不要落在工具批次中间，否则破坏第 4 章的配对协议。
 
