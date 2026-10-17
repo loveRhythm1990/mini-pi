@@ -52,7 +52,7 @@ Skill 的全部魔法就在这一张时序图里：
 
 三个要点：
 
-1. **"加载"不经过任何新机制**。模型读 SKILL.md 用的就是第 3 章的 `read` 工具——Skill 系统里没有"Skill 执行器"，只有发现、校验、清单和一条命令。这也是它实现量小的根本原因
+1. **“加载”不经过任何新机制**。模型读 SKILL.md 用的就是第 3 章的 `read` 工具——Skill 系统里没有“Skill 执行器”，只有发现、校验、清单和一条命令。这也是它实现量小的根本原因（pi 的源码级对照见后文「pi 的真实实现」一节）
 2. **描述就是路由**。模型判断"要不要读全文"的唯一依据是 frontmatter 里的 description，所以规范要求 description 必须同时写清"做什么"和"**何时用**"——写成"帮助处理 PDF"这种话，模型无从路由
 3. **成本模型与扩展相反**。扩展的工具定义每次请求都在场（所以 pi 有"注册 ≠ 激活"）；Skill 的全文只在被需要时进场。第 4 章的压缩是给上下文"卸货"，Skill 是"延迟装货"——同一门上下文经济学
 
@@ -126,7 +126,70 @@ return [{"role": "system", "content": prompt}] + self.session.build_context()
 
 这是本章对第 5 章唯一的修改，也是它想讲的设计观点：**系统提示本来就是宿主组装的产物**（提示词、工具清单、Skill 清单都是"每次请求要带上的状态"），给它一条显式的追加通道，比让每个功能各自改写提示更诚实。
 
-`/skill` 命令注册（`register_skill_command`）复用第 5 章的命令注册表；处理器把 `skill.full_text()` 与用户参数拼成一条 user 消息交给 `agent.prompt()`。强制加载对 `disable-model-invocation` 的 Skill 同样有效——这个标志的全部含义就是"不进自动清单，但保留手动入口"。
+`/skill` 命令注册（`register_skill_command`）复用第 5 章的命令注册表；处理器把 `skill.full_text()` 与用户参数拼成一条 user 消息交给 `agent.prompt()`。强制加载对 `disable-model-invocation` 的 Skill 同样有效——这个标志的全部含义就是“不进自动清单，但保留手动入口”。
+
+## pi 的真实实现：两条路径与五个零件
+
+mini-pi 的两条加载路径不是猜测。pi 的源码一模一样地分两条路实现，而**两条路都没有专用的“Skill 工具”**：模型自取走的是普通工具调用，强制加载走的是宿主侧文本展开。参与者一共五个零件：
+
+| 零件 | pi 源码（提交 `8bb180b`） | 作用 |
+|---|---|---|
+| `resourceLoader.getSkills()` | [resource-loader.ts L433](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/resource-loader.ts#L433) | 启动扫描、frontmatter 校验，产出 Skill 列表 |
+| `formatSkillsForPrompt()` | [skills.ts L358](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/skills.ts#L358) | 拼 `<available_skills>` 清单，**点名用哪个工具加载** |
+| `read` / `bash` | 内置工具 | 真正的“加载”动作：一次普通文件读取 |
+| `_expandSkillCommand()` | [agent-session.ts L2147](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/agent-session.ts#L2147) | `/skill:名字 参数` 的展开器 |
+| `parseSkillBlock()` | [agent-session.ts L177](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/agent-session.ts#L177) | 识别注入后的 `<skill>` 块（结构化展示用） |
+
+### 模型自取：提示点名，工具是普通的
+
+`formatSkillsForPrompt` 接受一个三态参数——提示词里点不点名、点哪个工具，取决于当时可用的工具集：
+
+```typescript
+// skills.ts L358
+export function formatSkillsForPrompt(
+	skills: Skill[],
+	fileReadTool: "read" | "bash" | "indirect" = "read",
+): string {
+	...
+	fileReadTool === "read"
+		? "Use the read tool to load a skill's file when the task matches its description."
+		: fileReadTool === "bash"
+			? "Use bash to load a skill's file when the task matches its description."
+			: "Load a skill's file when the task matches its description.",
+	"When a skill file references a relative path, resolve it against the skill directory …");
+```
+
+- 有 `read` → 点名 `read`（默认）
+- 只剩 `bash`（工具被限到极简集）→ 点名 `bash`，模型用 `cat` 读
+- `read` 被隐藏（第 5 章的 exposure）→ 不点名（[system-prompt.ts L176](https://github.com/earendil-works/pi/blob/8bb180bec133199c913ca8ef9bb30bd9ab12a72b/packages/coding-agent/src/core/system-prompt.ts#L176) 的注释：唯一的阅读器虽被隐藏但仍可达时，清单保留但不指名工具——建议模型调一个看不见的工具只会误导）
+
+于是模型的一次 Skill 加载就是一次再普通不过的 `read(location)` 工具调用，结果是一条普通的 toolResult。没有专用工具、没有新的执行机制——这正是第一部分“复用文件工具”的对照实体。
+
+### 强制加载：宿主侧文本展开
+
+`/skill:名字 参数` 则完全不碰工具。`_expandSkillCommand` 在宿主里直接改写输入文本：
+
+```typescript
+// agent-session.ts L2147（节选）
+const content = readFileSync(skill.filePath, "utf-8");
+const body = stripFrontmatter(content).trim();
+const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">
+References are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+return args ? `${skillBlock}\n\n${args}` : skillBlock;
+```
+
+产出的文本作为 user 消息发给模型；找不到同名 Skill 时原样放行（当作普通输入）。此外还有一个 `parseSkillBlock` 能从消息文本里识别出 `<skill>` 块——宿主可以据此做结构化展示，区分“注入的 Skill 指令”和“用户自己写的话”。
+
+### 与 mini-pi 的对照
+
+| | mini-pi `skills.py` | pi（提交 `8bb180b`） |
+|---|---|---|
+| 模型自取 | 提示指导模型用 `read` 读「完整指令」路径 | 同；且按工具集三态点名 `read`/`bash`/不点名 |
+| 强制加载 | `/skill` 拼纯文本 user 消息 | `/skill:名字` 展开成 `<skill>` 块 + 参数 |
+| 原文获取 | 处理器里 `skill.full_text()` | `readFileSync` + `stripFrontmatter` |
+| 注入后识别 | 无（纯文本） | `parseSkillBlock` 结构化解析 |
+
+两个实现共享同一个核心洞察：**Skill 系统的全部新颖之处都在“发现、清单、入口”这一层；“加载”本身没有机制，只有一次普通的文件读取**。
 
 ## 文件结构
 
