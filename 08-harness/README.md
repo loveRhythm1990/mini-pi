@@ -142,7 +142,7 @@ Mario Zechner 在 2025 年的设计文章中强调上下文控制和可观察性
 
 它支持极简方案可以完成一批有难度的任务，无法单独证明每一种被省略的机制都没有价值。要判断某机制的效果，需要控制其他变量。
 
-Benchmark 的通过条件也有边界。一项针对其他三个工具的 SWE-bench Verified 研究发现，通过评测的补丁仍可能有错误，研究中的问题合计使解决率高估约 6.4 个百分点。该研究没有评测 pi，不能把其错误率套用到 pi 上。[研究论文](https://software-lab.org/publications/icse2026_SWE-bench-correctness.pdf)
+Benchmark 的通过条件也有边界。一项针对其他三个工具的 SWE-bench Verified 研究发现，通过评测的补丁仍可能有错误，研究中的问题合计使解决率高估约 6.4 个百分点。该研究没有评测 pi，不能把其错误率套用到 pi 上。[研究论文](https://software-lab.org/publications/icse2026_SWE-bench-correctness.pdf)，第 9 章对此做了完整拆解。
 
 因此，分数可以提供比较证据，还需要检查验收覆盖、失败原因，以及任务与实际项目的相似程度。
 
