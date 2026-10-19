@@ -113,6 +113,7 @@
 ### 第 9 章：评测的可信度——SWE-bench 的“已解决”真的解决了吗？（[09-evaluation/](09-evaluation/README.md)）
 **核心概念**：测试通过 ≠ 补丁正确、差分测试、基准虚高
 
+- SWE-bench 的任务结构、判卷流程、常见变体与最小评测入口
 - SWE-bench 只运行 PR 修改过的测试文件，留下的验证盲区
 - “plausible but incorrect”补丁的规模：解决率高估约 6.4 个百分点
 - PatchDiff：以 oracle 补丁为参照，自动生成能区分两个补丁行为的测试

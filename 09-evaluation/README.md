@@ -14,6 +14,102 @@
 
 本章是论文解读，**不新增运行入口**。论文的数字与结论会标明来源；本教程的判断会单独说明。我没有复现论文实验。
 
+## 背景：SWE-bench 是什么？
+
+一句话：**把真实 GitHub 仓库里已经修好的 bug 做成考卷**。给 Agent 一个 issue 描述和一份有 bug 的代码快照，让它自己定位、修改；改完由项目原有的测试判卷。
+
+所以它考的不是“会不会写一个函数”，而是“能不能在陌生仓库里找到问题、跨文件修改，并让测试通过”。这也是它和 HumanEval、MBPP 那类函数级小谜题最大的区别。
+
+### 一道题长什么样
+
+每个任务（官方叫 instance）包含这些字段：
+
+| 字段 | 含义 |
+|---|---|
+| `repo` | 仓库名，如 `django/django`、`sympy/sympy` |
+| `base_commit` | 出 bug 的那个提交，Agent 看到的就是这个代码快照 |
+| `problem_statement` | issue 的标题和正文，有时附带相关讨论 |
+| `patch` | 人类修好这个 bug 的 PR 代码改动，也叫 **gold patch / oracle patch** |
+| `test_patch` | 同一个 PR 里**测试文件**的改动，评测时才应用 |
+| `FAIL_TO_PASS` | 修好后应当从“失败”变成“通过”的测试 |
+| `PASS_TO_PASS` | 修好后必须仍然通过的已有测试 |
+| `environment_setup_commit` | 用来构建运行环境的提交 |
+
+关键点：**Agent 看不到 `patch`，也看不到 `test_patch`**。它只有 issue 和代码。
+
+### 判卷流程
+
+```text
+base_commit 的仓库
+   + Agent 生成的补丁
+   + test_patch（隐藏的测试改动）
+        ↓
+运行 FAIL_TO_PASS：必须全过（证明 bug 真被修了）
+运行 PASS_TO_PASS：必须全过（证明没弄坏别的功能）
+        ↓
+全过 → resolved（解决）
+```
+
+最终统计 **resolved rate**（解决率），这就是排行榜上的分数。
+
+注意 `test_patch` 是“PR 里改过的测试文件”，不是整个仓库的测试。本章研究的论文攻击的正是这一点：**只跑这几个文件，覆盖不到的地方改坏了也发现不了**。
+
+### 数据怎么筛出来的
+
+官方从 12 个热门 Python 仓库（django、sympy、scikit-learn、matplotlib、pytest、requests、sphinx、astropy、xarray、pylint、flask、seaborn）爬取 PR，筛选条件是：
+
+1. PR 关联了一个 issue；
+2. PR 同时改了代码和测试；
+3. 应用 `test_patch` 后在 `base_commit` 上跑，测试**必须失败**（证明测试真能抓到这个 bug）；
+4. 再加上人类补丁跑，测试**必须通过**（证明这个补丁确实修好了）。
+
+这样筛出 **2,294 个任务**。第 3、4 步是 SWE-bench 质量的核心保障——它保证每道题都有可执行的判定依据。
+
+### 几个常见变体
+
+| 版本 | 规模 | 用途 |
+|---|---|---|
+| SWE-bench（Full） | 2,294 个任务 | 完整评测，跑一遍很贵 |
+| SWE-bench Lite | 300 个任务 | 便宜、快，适合日常迭代 |
+| **SWE-bench Verified** | 500 个任务 | OpenAI 请 93 名开发者人工筛掉“测试太具体、与 issue 无关”的题，质量最高；本章论文研究的就是它 |
+| SWE-bench Multimodal | JavaScript 任务，issue 含图片 | 考截图、报错图等视觉信息参与定位的能力 |
+
+Full 和 Lite 的判定协议相同，差别只是子集。
+
+### 怎么跑一次最小评测
+
+读数据不需要 Docker：
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("princeton-nlp/SWE-bench_Verified", split="test")
+print(ds[0]["problem_statement"])
+print(ds[0]["FAIL_TO_PASS"])
+```
+
+真正评测要用官方 harness（`swebench` 包 + Docker）：
+
+```bash
+pip install swebench
+python -m swebench.harness.run_evaluation \
+  --dataset_name princeton-nlp/SWE-bench_Verified \
+  --predictions_path your_predictions.jsonl \
+  --max_workers 4 \
+  --run_id my-first-run
+```
+
+`predictions.jsonl` 每行是 `{"instance_id": ..., "model_patch": "..."}`，其中 `model_patch` 就是一个 unified diff。**这是所有被测 Agent 的统一接口**：内部怎么循环、用什么工具都无所谓，最后交出一个 diff 即可。
+
+### 和本章的关系
+
+- 论文里的 **oracle patch** 就是数据集中的 `patch`；**plausible patch** 就是“过了 `FAIL_TO_PASS` / `PASS_TO_PASS`、但可能改错”的补丁；
+- 论文没有改数据集，也没有改判卷器，而是**在判卷之外另加一层检查**：用区分性测试暴露补丁之间的行为差异；
+- mini-pi 这样的 harness 若要“参加考试”，需要做的是：读 issue → 在 `base_commit` 上探索和修改 → 输出 diff。判卷由 SWE-bench harness 负责，不必自己实现；
+- 但**自建评测**时不要照抄“只跑相关测试”的做法——这正是论文指出的漏洞。
+
+三个容易误解的点：分数是在这个数据集上的通过率，不是模型能力的上限；通过测试不等于改对（见下文）；这些 PR 大多早于模型训练截止时间，存在数据污染的可能。
+
 ## 第一部分：问题——测试通过意味着什么？
 
 ### 1.1 SWE-bench 的判定方式
